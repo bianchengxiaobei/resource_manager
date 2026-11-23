@@ -239,7 +239,7 @@ cmake --build build/windows-bench --config Release --target parcel_bench
 ## 5. CI
 
 - Windows MSVC：Debug/Release、no-exceptions/no-rtti、ASan（已验证；Release 主套件
-  225 cases / 6162 assertions，性能 1 case / 5022 assertions；ASan 206 cases / 5803 assertions，24.88s）。
+  225 cases / 6162 assertions，性能 1 case / 5022 assertions；ASan 206 cases / 5803 assertions，48.65s）。
 - Windows ClangCL：UBSan（已验证，225 cases / 6162 assertions，0 runtime error；该构建启用 hbg 测试）。
 - assimp 启用：227 cases / 8820 assertions（含真实 `animation_with_skeleton.fbx` 动画/蒙皮与 `morph_animation.fbx` morph 导入 smoke）。
 - Clang/Linux：ASan/UBSan/TSan；CMake 选项 `PARCEL_ENABLE_ASAN/UBSAN/TSAN`（Windows ClangCL 走 UBSan 脚本），

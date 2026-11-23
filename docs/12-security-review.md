@@ -31,7 +31,7 @@
 | 依赖许可证 | 见 `THIRD_PARTY_NOTICES.md` | 内置依赖保留 LICENSE，外部依赖由宿主提供 |
 | 服务端上传并发 | 通过 | `TestConcurrentUploadsAndDownloads` 覆盖 4 上传 + 8×25 下载/config/未签名请求 |
 | 缓存完整性 | 通过 | `VerifyCacheFiles` 按 Metadata/Size/Content 校验当前 Manifest；内容级读文件核对 SHA-256/CRC32，损坏项删除并继续；`test_remote.cpp` |
-| UBSan/ASan | 通过 | MSVC ASan 24.88s (RelWithDebInfo, 206 cases/5803 assertions)；ClangCL 17 UBSan 225 cases/6162 assertions、0 runtime error；`scripts/run-ubsan.ps1` |
+| UBSan/ASan | 通过 | MSVC ASan 48.65s (RelWithDebInfo, 206 cases/5803 assertions)；ClangCL 17 UBSan 225 cases/6162 assertions、0 runtime error；`scripts/run-ubsan.ps1` |
 | WinHTTP/真实 CDN TLS | 部分验证 | WinHTTP loopback 下载与 session/connection 句柄复用通过 `scripts/run-winhttp-smoke.ps1`；真实 CDN/TLS/吞吐待宿主 |
 | Docker/nginx TLS 启动 | 待宿主验证 | 本机无 Docker；配置已静态审查 |
 
