@@ -33,7 +33,7 @@ parcel_bench（可选，PARCEL_BUILD_BENCHMARKS=ON）
   - cgltf 1.15（glTF/GLB；R03 已内置 `third_party/cgltf`）
   - stb_image/stb_dxt（PNG/TGA/JPG/HDR + BC1/3/5；R03 已内置 `third_party/stb`）
   - hdrp-bgfx 公共头（`PARCEL_HBG_ROOT` + `PARCEL_HBG_BGFX_INCLUDE_DIR`；R06 可选）
-  - meshoptimizer 0.18（Mesh 优化；R03 已内置 `third_party/meshoptimizer`）
+  - meshoptimizer 0.18（Mesh 优化 + glTF EXT_meshopt_compression 解码；R03 已内置 `third_party/meshoptimizer`）
   - bc7enc（BC7 纹理压缩；R03 已内置 `third_party/bc7enc`）
   - Python 3（可选，仅 `--shader-build-*` 调用 hdrp-bgfx `shader_build.py`）
   - 内置轻量 JSON parser/serializer（sidecar/meta/report；无外部依赖）
@@ -88,7 +88,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1 `
 
 ### 单元测试（C++）
 
-当前已验证（hbg-disabled Debug，主套件 204 cases / 5736 assertions；性能用例另计 1 case / 5022 assertions）：Result/Error、日志、
+当前已验证（hbg-disabled Debug，主套件 206 cases / 5803 assertions；性能用例另计 1 case / 5022 assertions）：Result/Error、日志、
 路径、SHA-256/CRC32、文件、时间、线程池、Operation/Scheduler、Guid128、二进制读写、
 压缩、PRCA/PRCL/PRCM、Manifest 零拷贝查找、FlatBuffers 可选 metadata 测试、golden
 files、资产/组件/Scene schema、sidecar JSON/组件映射、内容 hash 去重、导入/打包、Runtime 同步/异步加载、
@@ -103,7 +103,8 @@ Signed URL 缓存/403 重签、截断/随机 fuzz、安全边界拒绝、并发/
 - `.parcel.json` 解析、schema/错误上下文、设置路径与 camera override。
 - `.parcelmeta` 往返、GUID 派生、ImportDB 原子读写与确定性。
 - Import pipeline：PNG/TGA/HDR 解码、RGBA8/BGRA8/RGBA16F/RGBA32F、BC1/BC3/BC5/BC7、
-  mip、meshoptimizer、纹理跨源内容+设置复用、增量 skip/reimport、Shader manifest 打包、
+  mip、meshoptimizer、纹理跨源内容+设置复用、增量 skip/reimport、glTF/GLB 变体/场景选择/
+  EXT_meshopt_compression、Shader manifest 打包、
   shader build 调用/失败/强制重导、缺失二进制错误、并行 jobs。
 - mock `ISceneLoader` 两阶段加载契约。
 - Handle/Provider/BundleLoader 引用计数。
@@ -177,7 +178,7 @@ cmake --build build/windows-bench --config Release --target parcel_bench
 - EnTT 场景加载；SceneAsset → registry → 组件；回滚/自定义组件/卸载。
 - `parcel_hbg` 适配层：SceneRenderBridge（节点层级/动画 channel/morph weights）、AssetMaterializer（含 texture sampler 映射）、SettingsBridge、Shader 物化；GPU 设备端到端 smoke 需宿主 hdrp-bgfx。
 - assimp FBX 动画/蒙皮：真实 `animation_with_skeleton.fbx` 导入 AnimationClipAsset、AnimationPlayerComponent、MeshAsset.skinVertices 与 SkinComponent；`morph_animation.fbx` 导入 morph targets 与 AnimationPath::Weights 通道（配置 assimp 时）。
-- glTF/GLB：`triangle.gltf`/`triangle.glb` 导入 mesh/material/scene/skin/morph/TRS+Weights 动画，texture sampler wrap/filter 映射，embedded bufferView/data URI 图片导入纹理子资产，sidecar 覆盖与完整 Import 流水线（纹理 canonical 复用、二次导入 skip）。
+- glTF/GLB：`triangle.gltf`/`triangle.glb` 导入 mesh/material/scene/skin/morph/TRS+Weights 动画，texture sampler wrap/filter 映射，embedded bufferView/data URI 图片导入纹理子资产，EXT_meshopt_compression 解码，默认/命名/索引 scene 选择，sidecar 覆盖与完整 Import 流水线（纹理 canonical 复用、二次导入 skip）。
 - 跨 Bundle 引用、子资源、全部资源、RawFile。
 
 ### 故障注入
@@ -238,9 +239,9 @@ cmake --build build/windows-bench --config Release --target parcel_bench
 ## 5. CI
 
 - Windows MSVC：Debug/Release、no-exceptions/no-rtti、ASan（已验证；Release 主套件
-  223 cases / 6095 assertions，性能 1 case / 5022 assertions；ASan 204 cases / 5736 assertions，24.40s）。
-- Windows ClangCL：UBSan（已验证，223 cases / 6095 assertions，0 runtime error；该构建启用 hbg 测试）。
-- assimp 启用：225 cases / 8753 assertions（含真实 `animation_with_skeleton.fbx` 动画/蒙皮与 `morph_animation.fbx` morph 导入 smoke）。
+  225 cases / 6162 assertions，性能 1 case / 5022 assertions；ASan 206 cases / 5803 assertions，24.88s）。
+- Windows ClangCL：UBSan（已验证，225 cases / 6162 assertions，0 runtime error；该构建启用 hbg 测试）。
+- assimp 启用：227 cases / 8820 assertions（含真实 `animation_with_skeleton.fbx` 动画/蒙皮与 `morph_animation.fbx` morph 导入 smoke）。
 - Clang/Linux：ASan/UBSan/TSan；CMake 选项 `PARCEL_ENABLE_ASAN/UBSAN/TSAN`（Windows ClangCL 走 UBSan 脚本），
   TSan 不能与 ASan/UBSan 同时启用。
 - Go：`go vet`、`go test`；CI 执行 `go test -race`（本机无 cgo/gcc 时跳过）。

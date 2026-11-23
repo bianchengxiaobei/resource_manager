@@ -51,7 +51,9 @@ R02。
 - [x] `.gltf`/`.glb` 解析（cgltf；external/data URI buffer）。
 - [x] mesh/material/node/camera/KHR_lights_punctual 导入。
 - [x] glTF texture sampler（wrapS/T、min/mag/mip filter）写入 TextureRef。
+- [x] `EXT_meshopt_compression`：ATTRIBUTES/TRIANGLES/INDICES 与 NONE/Octahedral/Quaternion/Exponential filter 解码。
 - [x] `KHR_materials_variants`：按 `materialVariant` 设置选择变体材质，未覆盖 primitive 回退默认材质。
+- [x] glTF scene 选择：`scene` 支持名称/0-based 索引，空值使用默认 scene，未声明默认 scene 时回退全部 node；仅选中 scene 可达节点创建渲染组件。
 - [x] skin、morph targets、TRS/Weights 动画导入。
 - [x] sidecar settings/camera/light override 与额外场景组件。
 - [x] 无 skin mesh/material 内容去重；纹理 canonical GUID 复用。
@@ -119,7 +121,7 @@ R02。
 - 可选 shader build：`--shader-build-*` 调用 hdrp-bgfx `shader_build.py`，失败中止；成功后强制重导 Shader manifest
 - `parcel_import` CLI、并行导入、`import_report.json`
 - 真实 YooAsset FBX smoke：Material/Mesh/Scene + 1 个共享 Texture PRCA（3 个同内容纹理源复用），二次导入 skip
-- glTF/GLB smoke：triangle 场景导入 mesh/material/scene/skin/morph/animation；sidecar 覆盖；GLB 二进制 buffer；embedded bufferView/data URI 图片；sampler wrap/filter 映射；KHR_materials_variants 选择/回退；完整 Import 流水线纹理复用与二次 skip
+- glTF/GLB smoke：triangle 场景导入 mesh/material/scene/skin/morph/animation；sidecar 覆盖；GLB 二进制 buffer；embedded bufferView/data URI 图片；sampler wrap/filter 映射；KHR_materials_variants 选择/回退；EXT_meshopt_compression 解码；默认/命名/索引 scene 选择；完整 Import 流水线纹理复用与二次 skip
 
 R03 已完成。
 

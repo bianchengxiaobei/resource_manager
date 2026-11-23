@@ -106,7 +106,7 @@ R01、R02、R03。
   variant/backend、未使用资产、零引用、重复内容、内建目录字节数和 warnings/errors。
 - 测试：Pack 配置解析、确定性输出、共享 Bundle、增量复用、缺失依赖、循环依赖、
   Raw 多文件、None/LZ4/Zstd、Shader 自动收集、BuiltinCatalog 编解码/确定性。
-  当前总测试 204 cases / 5736 assertions。
+  当前总测试 206 cases / 5803 assertions。
 
 实现约定：
 

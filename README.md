@@ -169,7 +169,8 @@ R04 打包管线、R05 Runtime 核心、R06 EnTT/hbg 适配主体、R07 热更/�
   decals/probes/localFogVolumes 组件、同源内容去重。
 - glTF/GLB（内置 cgltf）：mesh/material/node/camera/KHR_lights_punctual、skin、morph targets、
   TRS/Weights 动画、sidecar 覆盖；external buffer/image、embedded image 子资产、
-  texture sampler（wrap/filter）、`KHR_materials_variants` 与纹理 canonical 复用。
+  texture sampler（wrap/filter）、`KHR_materials_variants`、`EXT_meshopt_compression`、
+  scene 选择与纹理 canonical 复用。
 - `parcel_import` CLI：`--project --source --output --db --jobs`，输出
   `<guid>.prca` + `import_report.json`；支持并行导入和失败回滚。
 - `parcel_pack`：collector（main/static/depend、目录/显式列表、地址/标签/共享策略）、

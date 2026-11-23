@@ -5,7 +5,7 @@ FileSystem、BundleLoader/Handle/Provider、PRCA 多对象/子资源、Resolver�
 加载、LoadingLock、UnloadAll、缓存 sidecar、诊断/泄漏报告和测试。
 Scene 实例化/卸载已接入 R06 `ISceneLoader`；BuiltinCatalog 已加载并支持无 catalog 回退；
 下载修复/断点续传依赖 R07；覆盖安装 footprint 已实现。
-当前测试：204 cases / 5736 assertions；Debug/Release/no-exceptions/ASan/
+当前测试：206 cases / 5803 assertions；Debug/Release/no-exceptions/ASan/
 exceptions/no-assimp 构建通过。
 
 ## 目标

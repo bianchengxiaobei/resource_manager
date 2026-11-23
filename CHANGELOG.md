@@ -35,7 +35,8 @@ All notable changes are recorded here. The project follows a pre-1.0 format.
   skin, morph targets, TRS/Weights animations, sidecar overrides, external buffers/images,
   GLB binary buffers, embedded bufferView/data URI images decoded into texture subassets,
   texture sampler wrap/filter mapping, `KHR_materials_variants` material selection,
-  and canonical texture reuse. glTF importer is v4.
+  `EXT_meshopt_compression` attribute/index decoding, glTF scene selection by name/index
+  (default scene when unset), and canonical texture reuse. glTF importer is v6.
 - Material TextureRef now carries a TextureSampler (wrap/filter); MaterialAsset serializer
   version is 2, and ParcelMaterialSystem uploads per-sampler texture variants for hdrp-bgfx.
   FBX importer is v8 so existing metas reimport.

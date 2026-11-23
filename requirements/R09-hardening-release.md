@@ -36,7 +36,7 @@ R00-R08。
 ### Sanitizers
 
 - [x] ASan（MSVC，全量测试通过）。
-- [x] UBSan（ClangCL 17 + MSVC STL，223 cases / 6095 assertions；`scripts/run-ubsan.ps1`）。
+- [x] UBSan（ClangCL 17 + MSVC STL，225 cases / 6162 assertions；`scripts/run-ubsan.ps1`）。
 - [ ] TSan（线程池/下载/调度，如可行）。
 - [x] MSVC ASan（可选）。
 - [x] 清零已知 ASan 问题。

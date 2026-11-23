@@ -21,7 +21,7 @@
 | AnimationClipAsset metadata | 通过 | channel/key 数量上限、时间单调/range、target 非 0、有限浮点校验；`test_assets.cpp` |
 | MeshAsset 蒙皮顶点 | 通过 | skin 数量与顶点数一致、权重有限/非负；大数量仍由 Blob 长度校验；`test_assets.cpp`、`test_import.cpp` |
 | MeshAsset morph targets | 通过 | target 数量/总 delta 上限、delta 数量与顶点一致、normal/tangent flag 与实际数组一致、delta/默认权重有限；`test_assets.cpp`、`test_import.cpp` |
-| glTF/GLB 解析 | 通过 | cgltf parse/load/validate、required Draco/meshopt/basisu/WebP 拒绝、mesh 顶点/索引/morph budget、buffer 大小上限/路径限制在 project root、embedded image 大小/尺寸/decode 校验；`test_gltf.cpp` |
+| glTF/GLB 解析 | 通过 | cgltf parse/load/validate、required Draco/basisu/WebP 拒绝、EXT_meshopt_compression source range/单 bufferView 与累计 512 MiB 解码预算、mesh 顶点/索引/morph budget、buffer 大小上限/路径限制在 project root、embedded image 大小/尺寸/decode 校验；`test_gltf.cpp` |
 | SkinComponent | 通过 | joint/matrix 数量一致、joint 非 0、矩阵有限、joint 实体存在性校验；`test_scene.cpp`、`test_hbg.cpp` |
 | MorphComponent | 通过 | 权重数量上限、浮点有限；桥接时校验与 mesh morph target 数量一致；`test_scene.cpp`、`test_hbg.cpp` |
 | 上传大小/类型/哈希 | 通过 | multipart 流式大小限制、PRCM/PRCL magic/header/content hash 校验 |
@@ -31,7 +31,7 @@
 | 依赖许可证 | 见 `THIRD_PARTY_NOTICES.md` | 内置依赖保留 LICENSE，外部依赖由宿主提供 |
 | 服务端上传并发 | 通过 | `TestConcurrentUploadsAndDownloads` 覆盖 4 上传 + 8×25 下载/config/未签名请求 |
 | 缓存完整性 | 通过 | `VerifyCacheFiles` 按 Metadata/Size/Content 校验当前 Manifest；内容级读文件核对 SHA-256/CRC32，损坏项删除并继续；`test_remote.cpp` |
-| UBSan/ASan | 通过 | MSVC ASan 24.40s (RelWithDebInfo, 204 cases/5736 assertions)；ClangCL 17 UBSan 223 cases/6095 assertions、0 runtime error；`scripts/run-ubsan.ps1` |
+| UBSan/ASan | 通过 | MSVC ASan 24.88s (RelWithDebInfo, 206 cases/5803 assertions)；ClangCL 17 UBSan 225 cases/6162 assertions、0 runtime error；`scripts/run-ubsan.ps1` |
 | WinHTTP/真实 CDN TLS | 部分验证 | WinHTTP loopback 下载与 session/connection 句柄复用通过 `scripts/run-winhttp-smoke.ps1`；真实 CDN/TLS/吞吐待宿主 |
 | Docker/nginx TLS 启动 | 待宿主验证 | 本机无 Docker；配置已静态审查 |
 

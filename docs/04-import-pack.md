@@ -70,7 +70,7 @@ struct ImportResult {
 首批 Importer：
 
 - `fbx`：assimp 读取 mesh/material/texture/node/camera/light/animation/bone/blend shape；生成 MeshAsset/MaterialAsset/AnimationClipAsset/SceneAsset 和 SkinComponent。
-- `gltf`：内置 cgltf 读取 `.gltf`/`.glb`，支持 mesh/material/texture/node/camera/KHR_lights_punctual、KHR_materials_variants、skin、morph targets 与 TRS/Weights 动画。
+- `gltf`：内置 cgltf 读取 `.gltf`/`.glb`，支持 mesh/material/texture/node/camera/KHR_lights_punctual、KHR_materials_variants、EXT_meshopt_compression、scene 选择、skin、morph targets 与 TRS/Weights 动画。
 - `texture`：PNG/TGA/JPG/HDR → TextureAsset；BC1/BC3/BC5/BC7、RGBA16F/32F、mip。
 - `shader`：hdrp-bgfx manifest + bin → ShaderLibraryAsset。
 - `scene settings`：hdrp-bgfx JSON → Parcel Settings 资产。
@@ -104,7 +104,10 @@ struct ImportResult {
   材质映射到 MeshRenderer；支持 POSITION/NORMAL/TANGENT/TEXCOORD_0/1/COLOR_0、
   JOINTS_0..3/WEIGHTS_0..3（最多取 4 个影响）。
 - 场景：node 层级、TRS/matrix（matrix 分解为 TRS）、camera、KHR_lights_punctual
-  point/spot/directional；默认加载 glTF scene 中的全部 node。
+  point/spot/directional；导入设置 `scene` 支持场景名或 0-based 索引，留空使用 glTF 默认 scene，
+  未声明默认 scene 时回退全部 node。仅选中 scene 可达节点创建
+  Camera/Light/MeshRenderer/Skin/Morph 组件，全部 node 的 Transform 保留供
+  skin/animation 引用。
 - 材质：PBR metallic-roughness、alphaMode/cutoff、doubleSided、emissiveStrength、
   clearcoat/transmission/ior/iridescence/anisotropy/diffuseTransmission 字段映射；
   纹理引用保留 glTF sampler 的 wrapS/T、min/mag/mip filter，无 sampler 时使用
@@ -124,8 +127,11 @@ struct ImportResult {
   ImportDB 依赖。
 - 去重：无 skin 的 mesh 按内容 hash 去重；material 按内容 hash 去重；外部纹理沿用
   canonical texture GUID（文件内容 + 纹理设置）。
-- 限制：Draco/meshopt/basisu/WebP 的 required extension 返回 Unsupported；
-  KHR_texture_transform 尚未映射；多 scene 时使用全部 node。
+- 压缩：`EXT_meshopt_compression` 支持 ATTRIBUTES/TRIANGLES/INDICES 三种 mode 与
+  NONE/Octahedral/Quaternion/Exponential filter；使用内置 meshoptimizer 解码后
+  覆盖 bufferView 数据，单 bufferView 与累计解码均受 512 MiB 限制。
+- 限制：Draco/basisu/WebP 的 required extension 返回 Unsupported；
+  KHR_texture_transform 尚未映射；未选中 scene 的 mesh/material 仍会 cook。
   多个 node 复用同一 skinned mesh 且 skin joint 顺序不同时按各自 SkinComponent 解释，
   建议使用同一 skeleton。
 
@@ -329,10 +335,11 @@ cmake --preset windows-debug -DPARCEL_ASSIMP_ROOT=E:/Learn/assimp
   无法解析的骨骼/越界 morph target 追加 warning，probe 无有效 texture 时跳过。
 - 同一 FBX 导入内，material/mesh 按编码内容 hash 去重；纹理源按“内容 + 设置”选择
   canonical TextureAsset GUID，所有引用共享同一 cooked 资产。
-- glTF importer v4：内置 cgltf，支持 `.gltf`/`.glb`、external/data URI buffer、
-  mesh/material/node/camera/KHR_lights_punctual、KHR_materials_variants、skin、
-  morph targets、TRS/Weights 动画与 sidecar override；embedded image 解码为纹理子资产；
-  无 skin mesh/material 按内容去重，外部纹理复用 canonical GUID。
+- glTF importer v6：内置 cgltf，支持 `.gltf`/`.glb`、external/data URI buffer、
+  mesh/material/node/camera/KHR_lights_punctual、KHR_materials_variants、
+  EXT_meshopt_compression、scene 选择、skin、morph targets、TRS/Weights 动画与
+  sidecar override；embedded image 解码为纹理子资产；无 skin mesh/material 按内容去重，
+  外部纹理复用 canonical GUID。
 
 ## 17. R04 已实现契约
 
