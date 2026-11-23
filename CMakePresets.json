@@ -1,0 +1,130 @@
+﻿{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "windows-base",
+      "hidden": true,
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "PARCEL_BUILD_TESTS": "ON",
+        "PARCEL_BUILD_FUZZER": "OFF",
+        "PARCEL_CORE_NO_EXCEPTIONS": "ON",
+        "PARCEL_CORE_NO_RTTI": "ON"
+      }
+    },
+    {
+      "name": "windows-debug",
+      "displayName": "Windows Debug",
+      "inherits": "windows-base"
+    },
+    {
+      "name": "windows-release",
+      "displayName": "Windows Release",
+      "inherits": "windows-base"
+    },
+    {
+      "name": "windows-noexcept",
+      "displayName": "Windows no-exceptions / no-RTTI",
+      "inherits": "windows-base"
+    },
+    {
+      "name": "windows-asan",
+      "displayName": "Windows Debug + AddressSanitizer",
+      "inherits": "windows-base",
+      "cacheVariables": {
+        "PARCEL_ENABLE_ASAN": "ON"
+      }
+    },
+    {
+      "name": "windows-fuzz",
+      "displayName": "Windows Debug + fuzz targets",
+      "inherits": "windows-debug",
+      "cacheVariables": {
+        "PARCEL_BUILD_FUZZER": "ON"
+      }
+    },
+    {
+      "name": "windows-benchmark",
+      "displayName": "Windows Release + benchmarks",
+      "inherits": "windows-release",
+      "cacheVariables": {
+        "PARCEL_BUILD_BENCHMARKS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-debug",
+      "configurePreset": "windows-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "windows-release",
+      "configurePreset": "windows-release",
+      "configuration": "Release"
+    },
+    {
+      "name": "windows-noexcept",
+      "configurePreset": "windows-noexcept",
+      "configuration": "Debug"
+    },
+    {
+      "name": "windows-asan",
+      "configurePreset": "windows-asan",
+      "configuration": "Debug"
+    },
+    {
+      "name": "windows-fuzz",
+      "configurePreset": "windows-fuzz",
+      "configuration": "Debug"
+    },
+    {
+      "name": "windows-benchmark",
+      "configurePreset": "windows-benchmark",
+      "configuration": "Release",
+      "targets": ["parcel_bench"]
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "windows-debug",
+      "configurePreset": "windows-debug",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "windows-release",
+      "configurePreset": "windows-release",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "windows-noexcept",
+      "configurePreset": "windows-noexcept",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "windows-asan",
+      "configurePreset": "windows-asan",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}
+

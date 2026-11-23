@@ -1,0 +1,10 @@
+namespace parcel.test;
+
+table TestAsset {
+  name:string;
+  value:int;
+  payload:[ubyte];
+}
+
+root_type TestAsset;
+file_identifier "PRTE";

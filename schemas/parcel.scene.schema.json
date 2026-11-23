@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://parcel.local/schemas/parcel.scene.schema.json",
+  "title": "Parcel Scene Sidecar",
+  "description": "Schema for a .parcel.json scene sidecar. Fields mirror the hdrp-bgfx .hdrp.json sidecar and add Parcel asset references.",
+  "type": "object",
+  "required": ["version"],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
+    "source": {
+      "type": "string"
+    },
+    "coordinateSystem": {
+      "type": "string",
+      "enum": ["rh-y-up-ccw"]
+    },
+    "settings": {
+      "type": "object",
+      "properties": {
+        "pipeline": { "type": "string", "minLength": 1 },
+        "frame": { "type": "string", "minLength": 1 },
+        "postProcess": { "type": "string", "minLength": 1 },
+        "shadows": { "type": "string", "minLength": 1 },
+        "volumetricFog": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": true
+    },
+    "lights": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/objectOverride" }
+    },
+    "decals": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/objectOverride" }
+    },
+    "reflectionProbes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/objectOverride" }
+    },
+    "probes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/objectOverride" }
+    },
+    "localFogVolumes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/objectOverride" }
+    },
+    "cameras": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/camera" }
+    }
+  },
+  "$defs": {
+    "objectOverride": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "camera": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "projection": {
+          "type": "string",
+          "enum": ["perspective", "orthographic"]
+        },
+        "yfov": { "type": "number", "exclusiveMinimum": 0 },
+        "aspect": { "type": "number", "exclusiveMinimum": 0 },
+        "nearClip": { "type": "number", "exclusiveMinimum": 0 },
+        "farClip": { "type": "number", "exclusiveMinimum": 0 },
+        "xmag": { "type": "number" },
+        "ymag": { "type": "number" },
+        "clearColor": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": { "type": "number" }
+        },
+        "cullingMask": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "priority": { "type": "integer" }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

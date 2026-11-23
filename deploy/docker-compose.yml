@@ -1,0 +1,51 @@
+﻿name: parcel
+
+services:
+  parcel-server:
+    build:
+      context: ../server
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      PARCEL_LISTEN: ":8080"
+      PARCEL_DB: /data/parcel.db
+      PARCEL_BLOB_ROOT: /data/blobs
+      PARCEL_PUBLIC_BASE_URL: ${PARCEL_PUBLIC_BASE_URL:-https://localhost}
+      PARCEL_CDN_URLS: ${PARCEL_CDN_URLS:-}
+      PARCEL_JWT_SECRET: ${PARCEL_JWT_SECRET:?set PARCEL_JWT_SECRET}
+      PARCEL_HMAC_KEYS: ${PARCEL_HMAC_KEYS:?set PARCEL_HMAC_KEYS}
+      PARCEL_HMAC_KEY_ID: ${PARCEL_HMAC_KEY_ID:-primary}
+      PARCEL_ADMIN_USER: ${PARCEL_ADMIN_USER:-admin}
+      PARCEL_ADMIN_PASSWORD: ${PARCEL_ADMIN_PASSWORD:?set PARCEL_ADMIN_PASSWORD}
+      PARCEL_SECURE_COOKIES: "true"
+      PARCEL_REQUIRE_SIGNED_FILES: "true"
+      PARCEL_TRUST_PROXY: "true"
+      PARCEL_GRAY_SALT: ${PARCEL_GRAY_SALT:-parcel}
+      PARCEL_MIN_APP_VERSION: ${PARCEL_MIN_APP_VERSION:-}
+      PARCEL_LOG_FORMAT: json
+    volumes:
+      - parcel-data:/data
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "/parcel-server", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      parcel-server:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+
+volumes:
+  parcel-data:

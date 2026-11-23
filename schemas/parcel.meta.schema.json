@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Parcel Asset Meta",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "sourceGuid",
+    "importer",
+    "importerVersion",
+    "sourceHash",
+    "settingsHash",
+    "settings",
+    "assets",
+    "dependencies"
+  ],
+  "properties": {
+    "version": {"const": 1},
+    "sourceGuid": {"$ref": "#/$defs/guid"},
+    "importer": {"type": "string", "minLength": 1},
+    "importerVersion": {"type": "integer", "minimum": 1},
+    "sourceHash": {"$ref": "#/$defs/hash"},
+    "settingsHash": {"$ref": "#/$defs/hash"},
+    "settings": {"type": "object"},
+    "assets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["guid"],
+        "properties": {
+          "guid": {"$ref": "#/$defs/guid"},
+          "type": {"type": "string", "minLength": 1},
+          "role": {"type": "string", "minLength": 1},
+          "localId": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "dependencies": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/guid"}
+    }
+  },
+  "$defs": {
+    "guid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "hash": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  }
+}

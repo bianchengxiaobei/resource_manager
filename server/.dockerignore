@@ -1,0 +1,5 @@
+﻿web/node_modules
+internal/webui/dist/assets
+data
+backups
+*.log

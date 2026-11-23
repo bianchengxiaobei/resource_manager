@@ -1,0 +1,1110 @@
+﻿openapi: 3.1.0
+info:
+  title: Parcel Server API
+  version: 1.0.0
+  description: Single-node Parcel package distribution and administration API.
+servers:
+  - url: http://localhost:8080
+tags:
+  - name: client
+  - name: admin
+  - name: data
+  - name: ops
+paths:
+  /healthz:
+    get:
+      tags: [ops]
+      summary: Liveness and database readiness
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+        "503":
+          $ref: "#/components/responses/Error"
+  /metrics:
+    get:
+      tags: [ops]
+      summary: Prometheus text metrics
+      responses:
+        "200":
+          description: Metrics exposition
+          content:
+            text/plain:
+              schema:
+                type: string
+  /api/v1/auth/device-token:
+    post:
+      tags: [client]
+      summary: Issue a device JWT
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeviceTokenRequest"
+      responses:
+        "200":
+          description: Token issued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceTokenResponse"
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "429":
+          $ref: "#/components/responses/Error"
+  /api/v1/client/config:
+    get:
+      tags: [client]
+      summary: Resolve version, gray rules, CDN and auth metadata
+      parameters:
+        - $ref: "#/components/parameters/Package"
+        - $ref: "#/components/parameters/Channel"
+        - $ref: "#/components/parameters/PlayerID"
+        - $ref: "#/components/parameters/Platform"
+        - $ref: "#/components/parameters/AppVersion"
+      responses:
+        "200":
+          description: Resolved client configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClientConfig"
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /api/v1/client/version:
+    get:
+      tags: [client]
+      summary: Resolve only the active version
+      parameters:
+        - $ref: "#/components/parameters/Package"
+        - $ref: "#/components/parameters/Channel"
+        - $ref: "#/components/parameters/PlayerID"
+        - $ref: "#/components/parameters/Platform"
+        - $ref: "#/components/parameters/AppVersion"
+      responses:
+        "200":
+          description: Resolved version
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClientVersion"
+        "400":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /api/v1/client/url:
+    get:
+      tags: [client]
+      summary: Create an HMAC signed data URL
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: path
+          in: query
+          required: true
+          description: Absolute /files/... path
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Signed URL
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SignedURL"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /files/{path}:
+    get:
+      tags: [data]
+      summary: Download a manifest, hash, version text or bundle
+      description: Supports Range, ETag and immutable content-addressed caching. Signature query parameters are required when signed files are enforced.
+      parameters:
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: expires
+          in: query
+          schema:
+            type: integer
+            format: int64
+        - name: key_id
+          in: query
+          schema:
+            type: string
+        - name: signature
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: File content
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "206":
+          description: Partial content
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+  /api/v1/admin/login:
+    post:
+      tags: [admin]
+      summary: Start an admin session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Session created
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoginResponse"
+        "401":
+          $ref: "#/components/responses/Error"
+        "429":
+          $ref: "#/components/responses/Error"
+  /api/v1/admin/logout:
+    post:
+      tags: [admin]
+      summary: End an admin session
+      security:
+        - sessionCookie: []
+        - adminKey: []
+      responses:
+        "204":
+          description: Logged out
+        "401":
+          $ref: "#/components/responses/Error"
+  /api/v1/admin/me:
+    get:
+      tags: [admin]
+      summary: Current admin identity and CSRF token
+      security:
+        - sessionCookie: []
+        - adminKey: []
+      responses:
+        "200":
+          description: Current identity
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeResponse"
+  /api/v1/admin/api-keys:
+    post:
+      tags: [admin]
+      summary: Create an admin API key
+      security:
+        - sessionCookie: []
+        - adminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAPIKeyRequest"
+      responses:
+        "201":
+          description: API key created; plaintext is returned once
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/APIKeyResponse"
+        "403":
+          $ref: "#/components/responses/Error"
+  /api/v1/admin/overview:
+    get:
+      tags: [admin]
+      summary: Counts and in-process metrics
+      security:
+        - sessionCookie: []
+        - adminKey: []
+      responses:
+        "200":
+          description: Overview
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Overview"
+  /api/v1/admin/metrics:
+    get:
+      tags: [admin]
+      summary: Metrics snapshot as JSON
+      security:
+        - sessionCookie: []
+        - adminKey: []
+      responses:
+        "200":
+          description: Metrics snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetricsSnapshot"
+  /api/v1/admin/audit:
+    get:
+      tags: [admin]
+      summary: List audit entries
+      security:
+        - sessionCookie: []
+        - adminKey: []
+      parameters:
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/PageSize"
+      responses:
+        "200":
+          description: Audit page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuditPage"
+  /api/v1/admin/packages:
+    get:
+      tags: [admin]
+      summary: List packages
+      security:
+        - sessionCookie: []
+        - adminKey: []
+      responses:
+        "200":
+          description: Packages
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Package"
+    post:
+      tags: [admin]
+      summary: Create a package
+      security:
+        - sessionCookie: []
+        - adminKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePackageRequest"
+      responses:
+        "201":
+          description: Package created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Package"
+        "409":
+          $ref: "#/components/responses/Error"
+  /api/v1/admin/packages/{pkg}:
+    get:
+      tags: [admin]
+      summary: Get package and channels
+      security:
+        - sessionCookie: []
+        - adminKey: []
+      parameters:
+        - $ref: "#/components/parameters/Pkg"
+      responses:
+        "200":
+          description: Package detail
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  package:
+                    $ref: "#/components/schemas/Package"
+                  channels:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Channel"
+  /api/v1/admin/packages/{pkg}/versions:
+    get:
+      tags: [admin]
+      summary: List versions
+      security:
+        - sessionCookie: []
+        - adminKey: []
+      parameters:
+        - $ref: "#/components/parameters/Pkg"
+      responses:
+        "200":
+          description: Versions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Version"
+    post:
+      tags: [admin]
+      summary: Upload a manifest and bundles
+      security:
+        - sessionCookie: []
+        - adminKey: []
+      parameters:
+        - $ref: "#/components/parameters/Pkg"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [version, manifest]
+              properties:
+                version:
+                  type: string
+                note:
+                  type: string
+                manifest_hash:
+                  type: string
+                manifest:
+                  type: string
+                  format: binary
+                bundles:
+                  type: array
+                  items:
+                    type: string
+                    format: binary
+      responses:
+        "201":
+          description: Draft version created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Version"
+        "400":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "413":
+          $ref: "#/components/responses/Error"
+  /api/v1/admin/packages/{pkg}/versions/{version}:
+    get:
+      tags: [admin]
+      summary: Get version detail
+      security:
+        - sessionCookie: []
+        - adminKey: []
+      parameters:
+        - $ref: "#/components/parameters/Pkg"
+        - $ref: "#/components/parameters/Version"
+      responses:
+        "200":
+          description: Version
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Version"
+  /api/v1/admin/packages/{pkg}/versions/{version}/publish:
+    post:
+      tags: [admin]
+      summary: Publish a version to a channel
+      security:
+        - sessionCookie: []
+        - adminKey: []
+      parameters:
+        - $ref: "#/components/parameters/Pkg"
+        - $ref: "#/components/parameters/Version"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PublishRequest"
+      responses:
+        "200":
+          description: Updated channel
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Channel"
+  /api/v1/admin/packages/{pkg}/rollback:
+    post:
+      tags: [admin]
+      summary: Roll a channel back
+      security:
+        - sessionCookie: []
+        - adminKey: []
+      parameters:
+        - $ref: "#/components/parameters/Pkg"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RollbackRequest"
+      responses:
+        "200":
+          description: Updated channel
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Channel"
+        "404":
+          $ref: "#/components/responses/Error"
+  /api/v1/admin/packages/{pkg}/channels:
+    get:
+      tags: [admin]
+      summary: List channels
+      security:
+        - sessionCookie: []
+        - adminKey: []
+      parameters:
+        - $ref: "#/components/parameters/Pkg"
+      responses:
+        "200":
+          description: Channels
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Channel"
+  /api/v1/admin/packages/{pkg}/channels/{channel}:
+    put:
+      tags: [admin]
+      summary: Point a channel at a version
+      security:
+        - sessionCookie: []
+        - adminKey: []
+      parameters:
+        - $ref: "#/components/parameters/Pkg"
+        - name: channel
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetChannelRequest"
+      responses:
+        "200":
+          description: Updated channel
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Channel"
+  /api/v1/admin/packages/{pkg}/gray-rules:
+    get:
+      tags: [admin]
+      summary: List gray rules
+      security:
+        - sessionCookie: []
+        - adminKey: []
+      parameters:
+        - $ref: "#/components/parameters/Pkg"
+      responses:
+        "200":
+          description: Gray rules
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/GrayRule"
+    post:
+      tags: [admin]
+      summary: Create a gray rule
+      security:
+        - sessionCookie: []
+        - adminKey: []
+      parameters:
+        - $ref: "#/components/parameters/Pkg"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GrayRuleRequest"
+      responses:
+        "201":
+          description: Gray rule
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GrayRule"
+  /api/v1/admin/packages/{pkg}/gray-rules/{id}:
+    put:
+      tags: [admin]
+      summary: Update a gray rule
+      security:
+        - sessionCookie: []
+        - adminKey: []
+      parameters:
+        - $ref: "#/components/parameters/Pkg"
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GrayRuleRequest"
+      responses:
+        "200":
+          description: Gray rule
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GrayRule"
+    delete:
+      tags: [admin]
+      summary: Delete a gray rule
+      security:
+        - sessionCookie: []
+        - adminKey: []
+      parameters:
+        - $ref: "#/components/parameters/Pkg"
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          $ref: "#/components/responses/Error"
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: parcel_session
+    adminKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    Package:
+      name: package
+      in: query
+      required: true
+      schema:
+        type: string
+    Channel:
+      name: channel
+      in: query
+      schema:
+        type: string
+        default: prod
+    PlayerID:
+      name: player_id
+      in: query
+      schema:
+        type: string
+    Platform:
+      name: platform
+      in: query
+      schema:
+        type: string
+    AppVersion:
+      name: app_version
+      in: query
+      schema:
+        type: string
+    Page:
+      name: page
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    PageSize:
+      name: page_size
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    Pkg:
+      name: pkg
+      in: path
+      required: true
+      schema:
+        type: string
+    Version:
+      name: version
+      in: path
+      required: true
+      schema:
+        type: string
+  responses:
+    Error:
+      description: JSON error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        request_id:
+          type: string
+    Health:
+      type: object
+      properties:
+        status:
+          type: string
+        version:
+          type: string
+        time:
+          type: string
+          format: date-time
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+          format: password
+    LoginResponse:
+      type: object
+      required: [user, csrf_token]
+      properties:
+        user:
+          $ref: "#/components/schemas/User"
+        csrf_token:
+          type: string
+    MeResponse:
+      type: object
+      required: [user, csrf_token, api_key]
+      properties:
+        user:
+          $ref: "#/components/schemas/User"
+        csrf_token:
+          type: string
+        api_key:
+          type: boolean
+    User:
+      type: object
+      required: [id, username, role, created_at]
+      properties:
+        id:
+          type: string
+        username:
+          type: string
+        role:
+          type: string
+          enum: [admin, operator]
+        created_at:
+          type: string
+          format: date-time
+    DeviceTokenRequest:
+      type: object
+      required: [player_id]
+      properties:
+        player_id:
+          type: string
+          maxLength: 128
+        package:
+          type: string
+        platform:
+          type: string
+    DeviceTokenResponse:
+      type: object
+      properties:
+        token:
+          type: string
+        token_type:
+          type: string
+        expires_in:
+          type: integer
+          format: int64
+        expires_at:
+          type: string
+          format: date-time
+    CreatePackageRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+    Package:
+      type: object
+      required: [id, name, created_at, version_count]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        version_count:
+          type: integer
+    Artifact:
+      type: object
+      required: [id, kind, name, sha256, size, created_at]
+      properties:
+        id:
+          type: string
+        kind:
+          type: string
+          enum: [manifest, manifest_hash, bundle]
+        name:
+          type: string
+        sha256:
+          type: string
+        size:
+          type: integer
+          format: int64
+        created_at:
+          type: string
+          format: date-time
+    Version:
+      type: object
+      required: [id, package_id, package, version, state, manifest_hash, note, created_at]
+      properties:
+        id:
+          type: string
+        package_id:
+          type: string
+        package:
+          type: string
+        version:
+          type: string
+        state:
+          type: string
+          enum: [draft, published, rolled_back]
+        manifest_hash:
+          type: string
+        note:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        published_at:
+          type: string
+          format: date-time
+        artifacts:
+          type: array
+          items:
+            $ref: "#/components/schemas/Artifact"
+    Channel:
+      type: object
+      required: [id, package_id, name, updated_at]
+      properties:
+        id:
+          type: string
+        package_id:
+          type: string
+        name:
+          type: string
+        version_id:
+          type: string
+        version:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+    PublishRequest:
+      type: object
+      properties:
+        channel:
+          type: string
+          default: prod
+    RollbackRequest:
+      type: object
+      properties:
+        channel:
+          type: string
+          default: prod
+        version:
+          type: string
+    SetChannelRequest:
+      type: object
+      required: [version]
+      properties:
+        version:
+          type: string
+    GrayRuleRequest:
+      type: object
+      required: [version, percentage]
+      properties:
+        version:
+          type: string
+        percentage:
+          type: integer
+          minimum: 0
+          maximum: 100
+        whitelist:
+          type: array
+          items:
+            type: string
+        platforms:
+          type: array
+          items:
+            type: string
+        min_app_version:
+          type: string
+        priority:
+          type: integer
+          minimum: -1000
+          maximum: 1000
+        enabled:
+          type: boolean
+    GrayRule:
+      required: [id, package_id, version_id, version, percentage, created_at, updated_at]
+      allOf:
+        - $ref: "#/components/schemas/GrayRuleRequest"
+        - type: object
+          properties:
+            id:
+              type: string
+            package_id:
+              type: string
+            version_id:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+            updated_at:
+              type: string
+              format: date-time
+    AuditEntry:
+      type: object
+      required: [id, action, target, created_at]
+      properties:
+        id:
+          type: string
+        user_id:
+          type: string
+        username:
+          type: string
+        action:
+          type: string
+        target:
+          type: string
+        detail:
+          type: string
+        request_id:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    AuditPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AuditEntry"
+        total:
+          type: integer
+        page:
+          type: integer
+        page_size:
+          type: integer
+    CreateAPIKeyRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          maxLength: 100
+        expires_in_hours:
+          type: integer
+          minimum: 0
+          maximum: 8760
+    APIKeyResponse:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        api_key:
+          type: string
+        expires:
+          type: string
+          format: date-time
+    ClientRule:
+      type: object
+      properties:
+        version:
+          type: string
+        percentage:
+          type: integer
+        whitelist:
+          type: array
+          items:
+            type: string
+        platforms:
+          type: array
+          items:
+            type: string
+        min_app_version:
+          type: string
+        enabled:
+          type: boolean
+    ClientConfig:
+      type: object
+      properties:
+        schema:
+          type: integer
+        package:
+          type: string
+        channel:
+          type: string
+        version:
+          type: string
+        manifest_hash:
+          type: string
+        cdn:
+          type: array
+          items:
+            type: string
+        sign_url:
+          type: string
+        auth:
+          type: object
+          properties:
+            mode:
+              type: string
+            header:
+              type: string
+            token_url:
+              type: string
+        gray:
+          type: object
+          properties:
+            salt:
+              type: string
+            rules:
+              type: array
+              items:
+                $ref: "#/components/schemas/ClientRule"
+        rollback:
+          type: object
+          properties:
+            previous_version:
+              type: string
+        reason:
+          type: string
+        min_app_version:
+          type: string
+        force_update:
+          type: boolean
+    ClientVersion:
+      type: object
+      properties:
+        schema:
+          type: integer
+        package:
+          type: string
+        channel:
+          type: string
+        version:
+          type: string
+        manifest_hash:
+          type: string
+        reason:
+          type: string
+        previous_version:
+          type: string
+        min_app_version:
+          type: string
+        force_update:
+          type: boolean
+    SignedURL:
+      type: object
+      properties:
+        url:
+          type: string
+        expires:
+          type: integer
+          format: int64
+        key_id:
+          type: string
+        signature:
+          type: string
+    Overview:
+      type: object
+      required: [counts, metrics]
+      properties:
+        counts:
+          type: object
+          properties:
+            packages:
+              type: integer
+            versions:
+              type: integer
+            channels:
+              type: integer
+            rules:
+              type: integer
+            users:
+              type: integer
+        metrics:
+          $ref: "#/components/schemas/MetricsSnapshot"
+    MetricsSnapshot:
+      type: object
+      required: [counters, gauges, uptime_seconds]
+      properties:
+        counters:
+          type: object
+          additionalProperties:
+            type: number
+        gauges:
+          type: object
+          additionalProperties:
+            type: number
+        uptime_seconds:
+          type: integer
+

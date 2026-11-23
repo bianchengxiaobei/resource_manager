@@ -1,0 +1,17 @@
+{
+  "package": "hello",
+  "version": "1.0.0",
+  "target": "windows",
+  "cooked": "cooked",
+  "output": "build",
+  "compression": "lz4",
+  "collectors": [
+    {
+      "name": "hello",
+      "type": "main",
+      "path": "",
+      "recursive": true,
+      "addressRule": "assetPath"
+    }
+  ]
+}

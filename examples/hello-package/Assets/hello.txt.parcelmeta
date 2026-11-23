@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "sourceGuid": "9ce8a66caec60872c5adda0cba973db5",
+  "importer": "text",
+  "importerVersion": 1,
+  "sourceHash": "sha256:3689eb8b70a545d594ae7e6603ada0cc2712c1dfb642dfed04e67aebb29ab3bb",
+  "settingsHash": "sha256:c856d7c2c7bc240006b1a033228bee3e6b4af4be01f3339273518e2a7ba61bcf",
+  "settings": {
+    "scale": 1,
+    "coordinateSystem": "rh-y-up-ccw",
+    "generateTangents": true,
+    "target": "windows"
+  },
+  "assets": [
+    {
+      "guid": "12ae6b004f7ebc9c8586c19c22425596",
+      "type": "TextAsset",
+      "role": "text",
+      "localId": "text"
+    }
+  ],
+  "dependencies": []
+}
