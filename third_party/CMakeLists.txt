@@ -97,9 +97,12 @@ else()
 endif()
 
 add_library(parcel_meshoptimizer STATIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/meshoptimizer/src/indexcodec.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/meshoptimizer/src/indexgenerator.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/meshoptimizer/src/overdrawoptimizer.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/meshoptimizer/src/vcacheoptimizer.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/meshoptimizer/src/vertexcodec.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/meshoptimizer/src/vertexfilter.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/meshoptimizer/src/vfetchoptimizer.cpp"
 )
 add_library(parcel::meshoptimizer ALIAS parcel_meshoptimizer)

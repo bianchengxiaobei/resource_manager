@@ -192,6 +192,7 @@ assets::JsonValue MakeDefaultImportSettings(std::string_view importer, std::stri
     }
     if (importer == "gltf") {
         string.string_value.clear();
+        add("scene", string);
         add("materialVariant", string);
     }
     string.string_value = std::string(target);

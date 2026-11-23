@@ -63,6 +63,7 @@ set(PARCEL_TEST_LIBS
     parcel_runtime
     parcel_remote
     parcel_scene
+    parcel_meshoptimizer
     parcel_catch2
 )
 

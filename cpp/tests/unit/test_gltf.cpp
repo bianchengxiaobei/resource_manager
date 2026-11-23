@@ -13,7 +13,10 @@
 #include "parcel/pack/pack.hpp"
 #include "parcel/scene/component_codec.hpp"
 #include "parcel/scene/components.hpp"
+#include "parcel/scene/scene_data.hpp"
 #include "test_util.hpp"
+
+#include <meshoptimizer.h>
 
 #include <algorithm>
 #include <array>
@@ -301,6 +304,94 @@ struct GltfFixture {
 
         WriteText(assets / "variants.gltf", text);
     }
+
+    void UseScenes() {
+        std::string text = TriangleGltf(true);
+        const std::string old_scenes = "\"scenes\": [{\"nodes\": [0]}],\n  \"scene\": 0,";
+        const auto scenes_position = text.find(old_scenes);
+        REQUIRE(scenes_position != std::string::npos);
+        text.replace(scenes_position, old_scenes.size(),
+                     "\"scenes\": [{\"name\": \"Main\", \"nodes\": [0]}, "
+                     "{\"name\": \"Extra\", \"nodes\": [6]}],\n  \"scene\": 0,");
+
+        const std::string old_nodes_end = "\n  ],\n  \"scenes\"";
+        const auto nodes_position = text.find(old_nodes_end);
+        REQUIRE(nodes_position != std::string::npos);
+        text.replace(nodes_position, old_nodes_end.size(),
+                     ",\n    {\"name\": \"ExtraNode\", \"mesh\": 0}\n  ],\n  \"scenes\"");
+
+        WriteText(assets / "scenes.gltf", text);
+    }
+
+    void UseMeshoptCompression() {
+        const std::array<float, 9> positions = {
+            0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f,
+        };
+        const std::array<std::uint32_t, 3> indices = {0, 1, 2};
+        std::vector<unsigned char> encoded_positions(
+            meshopt_encodeVertexBufferBound(3, sizeof(float) * 3));
+        const std::size_t position_size =
+            meshopt_encodeVertexBuffer(encoded_positions.data(), encoded_positions.size(),
+                                       positions.data(), 3, sizeof(float) * 3);
+        REQUIRE(position_size > 0);
+        encoded_positions.resize(position_size);
+
+        std::vector<unsigned char> encoded_indices(meshopt_encodeIndexBufferBound(3, 3));
+        const std::size_t index_size = meshopt_encodeIndexBuffer(
+            encoded_indices.data(), encoded_indices.size(), indices.data(), 3);
+        REQUIRE(index_size > 0);
+        encoded_indices.resize(index_size);
+
+        std::vector<std::byte> compressed(position_size + index_size);
+        std::memcpy(compressed.data(), encoded_positions.data(), position_size);
+        std::memcpy(compressed.data() + position_size, encoded_indices.data(), index_size);
+        WriteBinary(assets / "meshopt.bin", compressed);
+
+        std::string text = TriangleGltf(true);
+        const std::string old_used = "\"extensionsUsed\": [\"KHR_lights_punctual\"],";
+        const auto used_position = text.find(old_used);
+        REQUIRE(used_position != std::string::npos);
+        text.replace(used_position, old_used.size(),
+                     "\"extensionsUsed\": [\"KHR_lights_punctual\", "
+                     "\"EXT_meshopt_compression\"],\n"
+                     "  \"extensionsRequired\": [\"EXT_meshopt_compression\"],");
+
+        const std::string old_buffers =
+            "\"buffers\": [{\"uri\": \"triangle.bin\", \"byteLength\": 368}],";
+        const auto buffers_position = text.find(old_buffers);
+        REQUIRE(buffers_position != std::string::npos);
+        text.replace(buffers_position, old_buffers.size(),
+                     "\"buffers\": [{\"uri\": \"triangle.bin\", \"byteLength\": 368}, "
+                     "{\"uri\": \"meshopt.bin\", \"byteLength\": " +
+                         std::to_string(compressed.size()) + "}],");
+
+        const std::string old_position_view =
+            "    {\"buffer\": 0, \"byteOffset\": 0, \"byteLength\": 36},";
+        const auto position_view_position = text.find(old_position_view);
+        REQUIRE(position_view_position != std::string::npos);
+        text.replace(position_view_position, old_position_view.size(),
+                     "    {\"buffer\": 0, \"byteOffset\": 0, \"byteLength\": 36, "
+                     "\"extensions\": {\"EXT_meshopt_compression\": {\"buffer\": 1, "
+                     "\"byteOffset\": 0, \"byteLength\": " +
+                         std::to_string(position_size) +
+                         ", \"byteStride\": 12, \"count\": 3, \"mode\": \"ATTRIBUTES\", "
+                         "\"filter\": \"NONE\"}}},");
+
+        const std::string old_index_view =
+            "    {\"buffer\": 0, \"byteOffset\": 96, \"byteLength\": 6},";
+        const auto index_view_position = text.find(old_index_view);
+        REQUIRE(index_view_position != std::string::npos);
+        text.replace(index_view_position, old_index_view.size(),
+                     "    {\"buffer\": 0, \"byteOffset\": 96, \"byteLength\": 6, "
+                     "\"extensions\": {\"EXT_meshopt_compression\": {\"buffer\": 1, "
+                     "\"byteOffset\": " +
+                         std::to_string(position_size) +
+                         ", \"byteLength\": " + std::to_string(index_size) +
+                         ", \"byteStride\": 2, \"count\": 3, \"mode\": \"TRIANGLES\", "
+                         "\"filter\": \"NONE\"}}},");
+
+        WriteText(assets / "meshopt.gltf", text);
+    }
 };
 
 parcel::import::ImportRequest Request(const GltfFixture& fixture, const std::string& file,
@@ -355,6 +446,20 @@ const MaterialAsset* SceneMaterial(const parcel::import::ImportResult& result,
         }
     }
     return nullptr;
+}
+
+bool HasMeshRendererForEntity(const parcel::scene::SceneData& scene, std::string_view name) {
+    const auto* chunk = scene.FindComponent(parcel::scene::kMeshRendererComponentType);
+    if (chunk == nullptr) {
+        return false;
+    }
+    for (const auto owner : chunk->owners) {
+        const auto* entity = scene.FindEntity(owner);
+        if (entity != nullptr && entity->name == name) {
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace
@@ -528,6 +633,90 @@ TEST_CASE("glTF importer selects KHR_materials_variants") {
     auto missing_import = import_with_variant("Missing");
     REQUIRE_FALSE(missing_import);
     CHECK(missing_import.GetError().code == parcel::core::ErrorCode::InvalidArgument);
+}
+
+TEST_CASE("glTF importer selects default and named scenes") {
+    GltfFixture fixture;
+    fixture.UseScenes();
+    auto importers = parcel::import::CreateStandardImporterRegistry();
+    REQUIRE(importers);
+    const auto* importer = importers.Value().FindForExtension(".gltf");
+    REQUIRE(importer != nullptr);
+
+    const auto import_with_scene = [&](std::string_view scene) {
+        auto settings = parcel::import::MakeDefaultImportSettings("gltf", "windows");
+        for (auto& [key, value] : settings.object_value) {
+            if (key == "scene") {
+                value.string_value.assign(scene);
+            }
+        }
+        return importer->Import(Request(fixture, "scenes.gltf", settings));
+    };
+
+    auto default_import = import_with_scene("");
+    REQUIRE(default_import);
+    CHECK(default_import.Value().warnings.empty());
+    const auto* default_scene =
+        dynamic_cast<const SceneAsset*>(FindAsset(default_import.Value(), "scene"));
+    REQUIRE(default_scene != nullptr);
+    CHECK(default_scene->scene.entities.size() == 7);
+    CHECK(HasMeshRendererForEntity(default_scene->scene, "MeshNode"));
+    CHECK_FALSE(HasMeshRendererForEntity(default_scene->scene, "ExtraNode"));
+
+    auto extra_import = import_with_scene("Extra");
+    REQUIRE(extra_import);
+    const auto* extra_scene =
+        dynamic_cast<const SceneAsset*>(FindAsset(extra_import.Value(), "scene"));
+    REQUIRE(extra_scene != nullptr);
+    CHECK(extra_scene->scene.entities.size() == 7);
+    CHECK(HasMeshRendererForEntity(extra_scene->scene, "ExtraNode"));
+    CHECK_FALSE(HasMeshRendererForEntity(extra_scene->scene, "MeshNode"));
+
+    auto indexed_import = import_with_scene("1");
+    REQUIRE(indexed_import);
+    const auto* indexed_scene =
+        dynamic_cast<const SceneAsset*>(FindAsset(indexed_import.Value(), "scene"));
+    REQUIRE(indexed_scene != nullptr);
+    CHECK(HasMeshRendererForEntity(indexed_scene->scene, "ExtraNode"));
+    CHECK_FALSE(HasMeshRendererForEntity(indexed_scene->scene, "MeshNode"));
+
+    auto missing_import = import_with_scene("Missing");
+    REQUIRE_FALSE(missing_import);
+    CHECK(missing_import.GetError().code == parcel::core::ErrorCode::InvalidArgument);
+}
+
+TEST_CASE("glTF importer decodes EXT_meshopt_compression") {
+    GltfFixture fixture;
+    fixture.UseMeshoptCompression();
+    auto importers = parcel::import::CreateStandardImporterRegistry();
+    REQUIRE(importers);
+    const auto* importer = importers.Value().FindForExtension(".gltf");
+    REQUIRE(importer != nullptr);
+    const auto settings = parcel::import::MakeDefaultImportSettings("gltf", "windows");
+    auto imported = importer->Import(Request(fixture, "meshopt.gltf", settings));
+    REQUIRE(imported);
+    CHECK(imported.Value().warnings.empty());
+
+    const auto* mesh = dynamic_cast<const MeshAsset*>(FindAsset(imported.Value(), "mesh"));
+    REQUIRE(mesh != nullptr);
+    REQUIRE(mesh->vertices.size() == 3);
+    bool has_origin = false;
+    bool has_x = false;
+    bool has_y = false;
+    for (const auto& vertex : mesh->vertices) {
+        has_origin = has_origin || (vertex.position.x == Catch::Approx(0.0f) &&
+                                    vertex.position.y == Catch::Approx(0.0f));
+        has_x = has_x || (vertex.position.x == Catch::Approx(1.0f) &&
+                          vertex.position.y == Catch::Approx(0.0f));
+        has_y = has_y || (vertex.position.x == Catch::Approx(0.0f) &&
+                          vertex.position.y == Catch::Approx(1.0f));
+    }
+    CHECK(has_origin);
+    CHECK(has_x);
+    CHECK(has_y);
+    auto indices = mesh->indices;
+    std::sort(indices.begin(), indices.end());
+    CHECK(indices == std::vector<std::uint32_t>{0, 1, 2});
 }
 
 TEST_CASE("glTF importer decodes embedded images") {

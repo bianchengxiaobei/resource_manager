@@ -13,6 +13,7 @@ under `third_party/`; distribution must retain them.
 | Zstandard | 1.5.7 | BSD-3-Clause | `third_party/zstd/LICENSE` |
 | stb_image / stb_image_resize | vendored snapshot | MIT or public domain (dual) | `third_party/stb/README.md` |
 | cgltf | 1.15 | MIT | `third_party/cgltf/cgltf.h` (license in `third_party/cgltf/LICENSE.txt`) |
+| meshoptimizer | 0.18 | MIT | `third_party/meshoptimizer/LICENSE.md` |
 
 ## Optional host dependencies
 

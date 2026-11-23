@@ -35,6 +35,8 @@
 #include <utility>
 #include <vector>
 
+#include <meshoptimizer.h>
+
 #define CGLTF_IMPLEMENTATION
 #include "cgltf.h"
 
@@ -339,19 +341,19 @@ bool ReadEmbeddedImage(const cgltf_image* image, std::vector<std::byte>& bytes,
     }
     if (image->buffer_view != nullptr) {
         const cgltf_buffer_view& view = *image->buffer_view;
-        if (view.buffer == nullptr || view.buffer->data == nullptr) {
-            error = "image buffer view has no data";
-            return false;
-        }
-        if (view.offset > view.buffer->size || view.size > view.buffer->size - view.offset) {
-            error = "image buffer view is outside the buffer";
-            return false;
-        }
         if (view.size == 0 || view.size > kMaxEmbeddedImageBytes) {
             error = "image buffer view has an invalid size";
             return false;
         }
-        const auto* begin = static_cast<const std::byte*>(view.buffer->data) + view.offset;
+        if (view.data == nullptr && (view.buffer == nullptr || view.buffer->data == nullptr)) {
+            error = "image buffer view has no data";
+            return false;
+        }
+        const auto* begin = reinterpret_cast<const std::byte*>(cgltf_buffer_view_data(&view));
+        if (begin == nullptr) {
+            error = "image buffer view has no data";
+            return false;
+        }
         bytes.assign(begin, begin + view.size);
         return true;
     }
@@ -637,6 +639,108 @@ core::Result<void> ValidateExternalBuffers(const cgltf_data& data, const ImportR
     return {};
 }
 
+core::Result<void> DecodeMeshoptBufferViews(cgltf_data& data, const ImportRequest& request) {
+    std::uint64_t total_decoded = 0;
+    for (cgltf_size view_index = 0; view_index < data.buffer_views_count; ++view_index) {
+        cgltf_buffer_view& view = data.buffer_views[view_index];
+        if (!view.has_meshopt_compression) {
+            continue;
+        }
+        const cgltf_meshopt_compression& compressed = view.meshopt_compression;
+        if (view.data != nullptr) {
+            return MakeError(ErrorCode::Corrupt,
+                             "glTF meshopt buffer view already has decoded data")
+                .WithPath(request.source_path);
+        }
+        if (compressed.buffer == nullptr || compressed.buffer->data == nullptr) {
+            return MakeError(ErrorCode::Corrupt, "glTF meshopt source buffer has no data")
+                .WithPath(request.source_path);
+        }
+        if (compressed.stride == 0 || compressed.count == 0) {
+            return MakeError(ErrorCode::Corrupt,
+                             "glTF meshopt buffer view has an invalid stride or count")
+                .WithPath(request.source_path);
+        }
+        if (compressed.stride > kMaxBufferBytes ||
+            compressed.count > kMaxBufferBytes / compressed.stride) {
+            return MakeError(ErrorCode::InvalidArgument, "glTF meshopt buffer view is too large")
+                .WithPath(request.source_path);
+        }
+        const std::uint64_t decoded_size =
+            static_cast<std::uint64_t>(compressed.stride) * compressed.count;
+        if (decoded_size > kMaxBufferBytes || total_decoded > kMaxBufferBytes - decoded_size) {
+            return MakeError(ErrorCode::InvalidArgument,
+                             "glTF meshopt data exceeds the decode budget")
+                .WithPath(request.source_path);
+        }
+        if (compressed.offset > compressed.buffer->size ||
+            compressed.size > compressed.buffer->size - compressed.offset) {
+            return MakeError(ErrorCode::Corrupt, "glTF meshopt source range is outside the buffer")
+                .WithPath(request.source_path);
+        }
+
+        void* decoded =
+            data.memory.alloc_func(data.memory.user_data, static_cast<cgltf_size>(decoded_size));
+        if (decoded == nullptr) {
+            return MakeError(ErrorCode::Internal, "failed to allocate glTF meshopt buffer")
+                .WithPath(request.source_path);
+        }
+        const auto* source =
+            static_cast<const unsigned char*>(compressed.buffer->data) + compressed.offset;
+        int decode_result = -1;
+        switch (compressed.mode) {
+        case cgltf_meshopt_compression_mode_attributes:
+            decode_result = meshopt_decodeVertexBuffer(decoded, compressed.count, compressed.stride,
+                                                       source, compressed.size);
+            break;
+        case cgltf_meshopt_compression_mode_triangles:
+            decode_result = meshopt_decodeIndexBuffer(decoded, compressed.count, compressed.stride,
+                                                      source, compressed.size);
+            break;
+        case cgltf_meshopt_compression_mode_indices:
+            decode_result = meshopt_decodeIndexSequence(decoded, compressed.count,
+                                                        compressed.stride, source, compressed.size);
+            break;
+        default:
+            break;
+        }
+        if (decode_result != 0) {
+            data.memory.free_func(data.memory.user_data, decoded);
+            return MakeError(ErrorCode::Corrupt, "failed to decode glTF meshopt buffer view")
+                .WithPath(request.source_path);
+        }
+        if (compressed.mode == cgltf_meshopt_compression_mode_attributes) {
+            switch (compressed.filter) {
+            case cgltf_meshopt_compression_filter_octahedral:
+                meshopt_decodeFilterOct(decoded, compressed.count, compressed.stride);
+                break;
+            case cgltf_meshopt_compression_filter_quaternion:
+                meshopt_decodeFilterQuat(decoded, compressed.count, compressed.stride);
+                break;
+            case cgltf_meshopt_compression_filter_exponential:
+                meshopt_decodeFilterExp(decoded, compressed.count, compressed.stride);
+                break;
+            default:
+                break;
+            }
+        }
+
+        view.data = decoded;
+        if (view.stride == 0) {
+            view.stride = compressed.stride;
+        }
+        for (cgltf_size accessor_index = 0; accessor_index < data.accessors_count;
+             ++accessor_index) {
+            cgltf_accessor& accessor = data.accessors[accessor_index];
+            if (accessor.buffer_view == &view) {
+                accessor.stride = compressed.stride;
+            }
+        }
+        total_decoded += decoded_size;
+    }
+    return {};
+}
+
 struct TextureResolver {
     const ImportRequest& request;
     std::vector<std::string>& warnings;
@@ -844,6 +948,61 @@ const cgltf_material* SelectPrimitiveMaterial(const cgltf_primitive& primitive,
         }
     }
     return primitive.material;
+}
+
+const cgltf_scene* FindScene(const cgltf_data& data, std::string_view name) {
+    if (name.empty()) {
+        return data.scene;
+    }
+    for (cgltf_size index = 0; index < data.scenes_count; ++index) {
+        const char* scene_name = data.scenes[index].name;
+        if (scene_name != nullptr && name == scene_name) {
+            return &data.scenes[index];
+        }
+    }
+    bool numeric = true;
+    std::uint64_t scene_index = 0;
+    for (const char character : name) {
+        if (character < '0' || character > '9') {
+            numeric = false;
+            break;
+        }
+        const auto digit = static_cast<std::uint64_t>(character - '0');
+        if (scene_index >
+            (std::numeric_limits<std::uint64_t>::max() - digit) / static_cast<std::uint64_t>(10)) {
+            numeric = false;
+            break;
+        }
+        scene_index = scene_index * static_cast<std::uint64_t>(10) + digit;
+    }
+    if (numeric && scene_index < static_cast<std::uint64_t>(data.scenes_count)) {
+        return &data.scenes[static_cast<std::size_t>(scene_index)];
+    }
+    return nullptr;
+}
+
+std::unordered_set<const cgltf_node*> CollectSceneNodes(const cgltf_scene& scene) {
+    std::unordered_set<const cgltf_node*> result;
+    std::vector<const cgltf_node*> pending;
+    pending.reserve(scene.nodes_count);
+    for (cgltf_size index = 0; index < scene.nodes_count; ++index) {
+        if (scene.nodes[index] != nullptr) {
+            pending.push_back(scene.nodes[index]);
+        }
+    }
+    while (!pending.empty()) {
+        const cgltf_node* node = pending.back();
+        pending.pop_back();
+        if (node == nullptr || !result.insert(node).second) {
+            continue;
+        }
+        for (cgltf_size child = 0; child < node->children_count; ++child) {
+            if (node->children[child] != nullptr) {
+                pending.push_back(node->children[child]);
+            }
+        }
+    }
+    return result;
 }
 
 void AddSkinInfluence(assets::SkinVertex& vertex, std::uint16_t joint, float weight) {
@@ -1477,7 +1636,7 @@ void SetComponent(SceneData& scene, scene::EntityId owner, const T& component) {
 class GltfImporter final : public IAssetImporter {
   public:
     std::string_view Name() const noexcept override { return "gltf"; }
-    std::uint32_t Version() const noexcept override { return 4; }
+    std::uint32_t Version() const noexcept override { return 6; }
 
     bool Supports(std::string_view extension) const noexcept override {
         return extension == ".gltf" || extension == ".glb";
@@ -1534,13 +1693,14 @@ class GltfImporter final : public IAssetImporter {
                 continue;
             }
             const std::string_view name(extension);
-            if (name == "KHR_draco_mesh_compression" || name == "EXT_meshopt_compression" ||
-                name == "KHR_texture_basisu" || name == "EXT_texture_webp") {
+            if (name == "KHR_draco_mesh_compression" || name == "KHR_texture_basisu" ||
+                name == "EXT_texture_webp") {
                 return MakeError(ErrorCode::Unsupported,
                                  "required glTF extension is not supported: " + std::string(name))
                     .WithPath(request.source_path);
             }
         }
+        PARCEL_TRY(DecodeMeshoptBufferViews(*data, request));
         const std::string material_variant_name = SettingString(settings, "materialVariant", "");
         std::optional<cgltf_size> material_variant;
         if (!material_variant_name.empty()) {
@@ -1557,6 +1717,17 @@ class GltfImporter final : public IAssetImporter {
                     .WithPath(request.source_path);
             }
         }
+        const std::string scene_name = SettingString(settings, "scene", "");
+        const cgltf_scene* selected_scene = FindScene(*data, scene_name);
+        if (!scene_name.empty() && selected_scene == nullptr) {
+            return MakeError(ErrorCode::InvalidArgument, "glTF scene not found: " + scene_name)
+                .WithPath(request.source_path);
+        }
+        std::unordered_set<const cgltf_node*> selected_scene_nodes;
+        if (selected_scene != nullptr) {
+            selected_scene_nodes = CollectSceneNodes(*selected_scene);
+        }
+        const bool filter_scene_components = selected_scene != nullptr;
         if (data->meshes_count == 0 && data->cameras_count == 0 && data->animations_count == 0 &&
             data->nodes_count == 0) {
             return MakeError(ErrorCode::InvalidArgument, "glTF contains no importable scene data")
@@ -1808,7 +1979,8 @@ class GltfImporter final : public IAssetImporter {
             transform.parent = scene.entities[index].parent;
             AddComponent(scene, entity.value, transform);
 
-            if (node.camera != nullptr) {
+            const bool in_scene = !filter_scene_components || selected_scene_nodes.contains(&node);
+            if (in_scene && node.camera != nullptr) {
                 scene::CameraComponent camera;
                 if (node.camera->type == cgltf_camera_type_perspective) {
                     camera.projection = scene::CameraComponent::Projection::Perspective;
@@ -1831,7 +2003,7 @@ class GltfImporter final : public IAssetImporter {
                 AddComponent(scene, entity.value, camera);
             }
 
-            if (node.light != nullptr) {
+            if (in_scene && node.light != nullptr) {
                 scene::LightComponent light;
                 light.color = ToVec3(node.light->color);
                 light.intensity = node.light->intensity;
@@ -1854,7 +2026,7 @@ class GltfImporter final : public IAssetImporter {
                 AddComponent(scene, entity.value, light);
             }
 
-            if (node.mesh != nullptr) {
+            if (in_scene && node.mesh != nullptr) {
                 const auto mesh_index = mesh_indices.find(node.mesh);
                 if (mesh_index != mesh_indices.end() && mesh_index->second < mesh_infos.size() &&
                     !mesh_infos[mesh_index->second].guid.IsZero()) {

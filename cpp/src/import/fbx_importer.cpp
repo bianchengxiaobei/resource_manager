@@ -4,6 +4,7 @@
 #include "parcel/import/meta.hpp"
 #include "parcel/import/sidecar_merge.hpp"
 #include "parcel/import/texture_dedup.hpp"
+#include "texture_decode.hpp"
 
 #include "parcel/assets/animation_clip_asset.hpp"
 #include "parcel/assets/material_asset.hpp"
@@ -89,14 +90,111 @@ struct TextureResolver {
     std::vector<std::string>& warnings;
     std::vector<core::AssetGuid>& dependencies;
     std::unordered_map<std::string, core::AssetGuid>& textures_by_hash;
+    const aiScene* scene = nullptr;
+    std::vector<CookedAsset>& assets;
+    std::unordered_map<const aiTexture*, core::AssetGuid>& embedded_cache;
+
+    [[nodiscard]] core::AssetGuid ResolveEmbedded(std::uint32_t texture_index,
+                                                 const std::string_view text) {
+        if (scene == nullptr || texture_index >= scene->mNumTextures) {
+            warnings.push_back("embedded texture index is invalid: " + std::string(text));
+            return {};
+        }
+
+        const aiTexture* texture = scene->mTextures[texture_index];
+        if (texture == nullptr) {
+            warnings.push_back("embedded texture is missing: " + std::string(text));
+            return {};
+        }
+        if (const auto cached = embedded_cache.find(texture); cached != embedded_cache.end()) {
+            return cached->second;
+        }
+
+        const std::string source_label =
+            request.source_path + ":texture:" + std::to_string(texture_index);
+        std::shared_ptr<assets::TextureAsset> cooked_texture;
+        if (texture->mHeight == 0) {
+            if (texture->mWidth == 0 || texture->pcData == nullptr) {
+                warnings.push_back("embedded compressed texture is empty: " + std::string(text));
+                embedded_cache.emplace(texture, core::AssetGuid{});
+                return {};
+            }
+            const auto* begin = reinterpret_cast<const std::byte*>(texture->pcData);
+            const std::span<const std::byte> bytes(begin, texture->mWidth);
+            const std::string target =
+                request.settings != nullptr ? SettingString(*request.settings, "target", "") : "";
+            const assets::JsonValue texture_settings =
+                MakeDefaultImportSettings("texture", target);
+            auto decoded = DecodeTextureAsset(bytes, texture_settings, source_label);
+            if (!decoded) {
+                warnings.push_back("failed to decode embedded texture '" + std::string(text) +
+                                   "': " + decoded.GetError().ToString());
+                embedded_cache.emplace(texture, core::AssetGuid{});
+                return {};
+            }
+            cooked_texture = std::move(decoded).Value();
+        } else {
+            constexpr std::size_t kMaxEmbeddedDimension = 16384;
+            constexpr std::size_t kMaxEmbeddedPixels = 64ull * 1000ull * 1000ull;
+            const std::size_t width = texture->mWidth;
+            const std::size_t height = texture->mHeight;
+            if (width == 0 || height == 0 || texture->pcData == nullptr ||
+                width > kMaxEmbeddedDimension || height > kMaxEmbeddedDimension ||
+                width > kMaxEmbeddedPixels / height ||
+                width > std::numeric_limits<std::uint32_t>::max() / 4u) {
+                warnings.push_back("embedded raw texture dimensions are invalid: " +
+                                   std::string(text));
+                embedded_cache.emplace(texture, core::AssetGuid{});
+                return {};
+            }
+
+            cooked_texture = std::make_shared<assets::TextureAsset>();
+            cooked_texture->format = assets::TextureFormat::RGBA8;
+            cooked_texture->sRGB = true;
+            cooked_texture->mip_count = 1;
+            assets::TextureMip mip;
+            mip.width = static_cast<std::uint32_t>(width);
+            mip.height = static_cast<std::uint32_t>(height);
+            mip.row_pitch = static_cast<std::uint32_t>(width * 4u);
+            mip.data.resize(width * height * 4u);
+            for (std::size_t i = 0; i < width * height; ++i) {
+                const aiTexel& texel = texture->pcData[i];
+                mip.data[i * 4u + 0u] = static_cast<std::byte>(texel.r);
+                mip.data[i * 4u + 1u] = static_cast<std::byte>(texel.g);
+                mip.data[i * 4u + 2u] = static_cast<std::byte>(texel.b);
+                mip.data[i * 4u + 3u] = static_cast<std::byte>(texel.a);
+            }
+            cooked_texture->mips.push_back(std::move(mip));
+        }
+
+        const core::AssetGuid guid = MakeSubAssetGuid(
+            request.source_guid, "texture", "fbx-texture:" + std::to_string(texture_index));
+        CookedAsset cooked;
+        cooked.guid = guid;
+        cooked.local_id = "texture:fbx:" + std::to_string(texture_index);
+        cooked.role = "texture";
+        cooked.object = std::move(cooked_texture);
+        assets.push_back(std::move(cooked));
+        if (std::find(dependencies.begin(), dependencies.end(), guid) == dependencies.end()) {
+            dependencies.push_back(guid);
+        }
+        embedded_cache.emplace(texture, guid);
+        return guid;
+    }
 
     [[nodiscard]] core::AssetGuid Resolve(const aiString& value) {
         const std::string_view text(value.C_Str());
         if (text.empty()) {
             return {};
         }
+        if (scene != nullptr) {
+            const auto embedded = scene->GetEmbeddedTextureAndIndex(value.C_Str());
+            if (embedded.first != nullptr && embedded.second >= 0) {
+                return ResolveEmbedded(static_cast<std::uint32_t>(embedded.second), text);
+            }
+        }
         if (text.front() == '*') {
-            warnings.push_back("embedded texture is not supported: " + std::string(text));
+            warnings.push_back("embedded texture index is invalid: " + std::string(text));
             return {};
         }
         std::string texture_path = core::path::Normalize(text);
@@ -600,6 +698,7 @@ class FbxImporter final : public IAssetImporter {
         material_guids.reserve(scene->mNumMaterials);
         std::unordered_map<std::string, core::AssetGuid> materials_by_content;
         std::unordered_map<std::string, core::AssetGuid> textures_by_hash;
+        std::unordered_map<const aiTexture*, core::AssetGuid> embedded_textures;
         for (unsigned int i = 0; i < scene->mNumMaterials; ++i) {
             const aiMaterial* source = scene->mMaterials[i];
             auto material = std::make_shared<assets::MaterialAsset>();
@@ -636,7 +735,8 @@ class FbxImporter final : public IAssetImporter {
             }
 
             std::vector<core::AssetGuid> dependencies;
-            TextureResolver resolver{request, result.warnings, dependencies, textures_by_hash};
+            TextureResolver resolver{request, result.warnings, dependencies, textures_by_hash,
+                                     scene, result.assets, embedded_textures};
             const std::pair<aiTextureType, assets::TextureRef*> textures[] = {
                 {aiTextureType_BASE_COLOR, &material->base_color_texture},
                 {aiTextureType_DIFFUSE, &material->base_color_texture},
