@@ -1,4 +1,4 @@
-﻿#include "parcel/scene/component_codec.hpp"
+#include "parcel/scene/component_codec.hpp"
 
 #include "parcel/scene/scene_data.hpp"
 #include "parcel/serialize/math_io.hpp"
@@ -634,6 +634,56 @@ ComponentCodec<AudioSourceComponent>::Decode(std::span<const std::byte> payload)
 }
 
 Result<std::vector<std::byte>>
+ComponentCodec<AudioSourceMixComponent>::Encode(const AudioSourceMixComponent& value) {
+    BinaryWriter writer;
+    PARCEL_TRY(WriteEnum(writer, value.bus));
+    PARCEL_TRY(writer.WriteI32(value.priority));
+    PARCEL_TRY(writer.WriteBool(value.occlusion_enabled));
+    PARCEL_TRY(writer.WriteF32(value.occlusion_gain));
+    PARCEL_TRY(writer.WriteF32(value.occlusion_low_pass_gain));
+    PARCEL_TRY(writer.WriteF32(value.occlusion_low_pass_gain_high_frequency));
+    return writer.Release();
+}
+
+Result<AudioSourceMixComponent>
+ComponentCodec<AudioSourceMixComponent>::Decode(std::span<const std::byte> payload) {
+    BinaryReader reader(payload);
+    AudioSourceMixComponent value;
+    PARCEL_TRY_ASSIGN(value.bus, ReadEnum<AudioBus>(reader, 3));
+    PARCEL_TRY_ASSIGN(value.priority, reader.ReadI32());
+    PARCEL_TRY_ASSIGN(value.occlusion_enabled, reader.ReadBool());
+    PARCEL_TRY_ASSIGN(value.occlusion_gain, reader.ReadF32());
+    PARCEL_TRY_ASSIGN(value.occlusion_low_pass_gain, reader.ReadF32());
+    PARCEL_TRY_ASSIGN(value.occlusion_low_pass_gain_high_frequency, reader.ReadF32());
+    PARCEL_TRY(Finish(reader));
+    return value;
+}
+
+Result<std::vector<std::byte>>
+ComponentCodec<AudioReverbZoneComponent>::Encode(const AudioReverbZoneComponent& value) {
+    BinaryWriter writer;
+    PARCEL_TRY(serialize::WriteVec3(writer, value.half_extents));
+    PARCEL_TRY(WriteEnum(writer, value.preset));
+    PARCEL_TRY(writer.WriteI32(value.priority));
+    PARCEL_TRY(writer.WriteF32(value.transition_seconds));
+    PARCEL_TRY(writer.WriteBool(value.enabled));
+    return writer.Release();
+}
+
+Result<AudioReverbZoneComponent>
+ComponentCodec<AudioReverbZoneComponent>::Decode(std::span<const std::byte> payload) {
+    BinaryReader reader(payload);
+    AudioReverbZoneComponent value;
+    PARCEL_TRY_ASSIGN(value.half_extents, serialize::ReadVec3(reader));
+    PARCEL_TRY_ASSIGN(value.preset, ReadEnum<AudioReverbPreset>(reader, 5));
+    PARCEL_TRY_ASSIGN(value.priority, reader.ReadI32());
+    PARCEL_TRY_ASSIGN(value.transition_seconds, reader.ReadF32());
+    PARCEL_TRY_ASSIGN(value.enabled, reader.ReadBool());
+    PARCEL_TRY(Finish(reader));
+    return value;
+}
+
+Result<std::vector<std::byte>>
 ComponentCodec<AudioListenerComponent>::Encode(const AudioListenerComponent& value) {
     BinaryWriter writer;
     PARCEL_TRY(writer.WriteBool(value.enabled));
@@ -842,6 +892,12 @@ ComponentRegistry StandardRegistry() {
          kStandardComponentSchemaVersion, CollectFog});
     add({kAudioSourceComponentType, std::string(ComponentCodec<AudioSourceComponent>::type_name),
          kStandardComponentSchemaVersion, CollectAudio});
+    add({kAudioSourceMixComponentType,
+         std::string(ComponentCodec<AudioSourceMixComponent>::type_name),
+         kStandardComponentSchemaVersion, nullptr});
+    add({kAudioReverbZoneComponentType,
+         std::string(ComponentCodec<AudioReverbZoneComponent>::type_name),
+         kStandardComponentSchemaVersion, nullptr});
     add({kAudioListenerComponentType,
          std::string(ComponentCodec<AudioListenerComponent>::type_name),
          kStandardComponentSchemaVersion, CollectAudioListener});

@@ -1,4 +1,4 @@
-﻿# Requirements 执行索引
+# Requirements 执行索引
 
 ## 依赖关系
 
@@ -49,13 +49,13 @@ R03/R04 可与 R05 部分并行；R08 可在 R07 协议冻结后并行。
 | R00 | 已完成 |
 | R01 | 已完成 |
 | R02 | 已完成（EnTT concrete loader 延至 R06；AnimationClip/Player/Skin/Morph 已补） |
-| R03 | 完成（BC1/3/5/7、meshoptimizer、shader build、纹理跨源复用、sidecar 组件映射、FBX 节点动画/蒙皮/morph、glTF/GLB） |
-| R04 | 完成（加密/TOML 延后；BuiltinCatalog 已实现） |
-| R05 | 完成（Scene 生命周期、BuiltinCatalog、footprint/操作计时；下载修复由 R07 提供） |
-| R06 | 主体完成（Runtime Scene 生命周期、节点层级、动画 channel、蒙皮、morph、Light cookie/IES 采样完成；真实 bgfx/ForwardRenderer 端到端验证延后） |
-| R07 | 主体完成（WinHTTP loopback + watchdog + 每帧配额 + 共享调度 + SignedUrlProvider；真实 CDN/TLS 待补） |
-| R08 | 主体完成（Docker/WinHTTP 真实网络 smoke/Playwright/大规模压力测试延后） |
-| R09 | 进行中（fuzz/压力/ASan/基准/安全/发布基线完成；1h 长跑 + 格式/字符串 30 分钟 fuzz 已完成；TSan/真实 CDN smoke 待补） |
+| R03 | 完成（BC1/3/5/7、meshoptimizer、shader build、纹理跨源复用、sidecar 组件映射、FBX 节点动画/蒙皮/morph、glTF/GLB、KHR_texture_transform 共享 UV0/逐贴图纹理变体） |
+| R04 | 完成（加密延后；TOML、BuiltinCatalog、archive bundle 已实现） |
+| R05 | 完成（Scene 生命周期、BuiltinCatalog、footprint/操作计时、Unpacker/Importer；下载修复由 R07 提供） |
+| R06 | 主体完成（Runtime Scene 生命周期、节点层级、动画 channel、蒙皮、morph、Light cookie/IES 采样完成；合成/真实 Parcel 包资产的 bgfx/ForwardRenderer GPU smoke 已在 Windows/D3D12/D3D11/Vulkan 验证，包内 ShaderLibraryAsset 经 Bootstrap 内容寻址物化（blob 跨版本复用，硬链接/复制回退）后驱动真实 dxbc/spirv 库，10000 静态实例在 D3D12 验证，Proland 60067-node 和 OceanSphere 真实资产完成导入/打包及三后端 smoke；相对原 hdrp render-test 的帧预算和轻量 fractal_lod 场景绝对 60 fps 门禁已通过；baked terrain LOD 选择、CPU heightmap tile cache（精确 node bounds/camera ground）、CPU shared-grid 顶点变形、1km mesh + 500m submesh 的 60k vegetation frustum/5000m 距离剔除及 near/far LOD、CPU water FFT、CPU river mesh/terrain carve、river material 纹理、逐帧 wave normal、屏幕空间 Poisson foam 播种和 CPU foam 逐帧动画已支持，GPU shader 顶点变形、material tiles、逐实例 GPU instancing/imposter、GPU FFT 纹理和 GPU river particles/refraction 未覆盖） |
+| R07 | 主体完成（WinHTTP loopback + 真实 CDN/TLS 传输与完整安装 smoke + watchdog + 每帧配额 + 共享调度 + SignedUrlProvider + 真实服务端签名 URL smoke；真实 CDN 边缘签名/鉴权待补） |
+| R08 | 主体完成（Docker 容器启动、大规模压力测试延后；Playwright 管理端和 Windows nginx TLS 代理 smoke 已通过；包/版本重命名/删除与 CLI 灰度更新/删除已补） |
+| R09 | 进行中（fuzz/压力/ASan/基准/安全/发布基线完成；1h 长跑 + 格式/字符串 30 分钟 fuzz + 真实 CDN/TLS 传输/完整安装 + 真实服务端签名 URL smoke 已完成；TSan 需 Linux/CI，真实 CDN 边缘签名/鉴权待补） |
 
 ## 使用方式
 

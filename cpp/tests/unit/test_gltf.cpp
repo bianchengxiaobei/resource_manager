@@ -1,5 +1,6 @@
 ﻿#include <catch_amalgamated.hpp>
 
+#include "../../src/import/texture_decode.hpp"
 #include "parcel/assets/animation_clip_asset.hpp"
 #include "parcel/assets/asset_codec.hpp"
 #include "parcel/assets/material_asset.hpp"
@@ -69,6 +70,16 @@ void WriteBinary(const std::filesystem::path& path, std::span<const std::byte> d
 std::vector<std::byte> TgaBytes() {
     const std::array<std::uint8_t, 22> pixels = {0, 0, 2, 0, 0, 0,  0, 0, 0, 0,   0,
                                                  0, 1, 0, 1, 0, 32, 8, 0, 0, 255, 255};
+    std::vector<std::byte> bytes(sizeof(pixels));
+    std::memcpy(bytes.data(), pixels.data(), bytes.size());
+    return bytes;
+}
+
+std::vector<std::byte> HorizontalTga() {
+    const std::array<std::uint8_t, 34> pixels = {
+        0, 0, 2, 0,   0,   0, 0,   0, 0,   0,   0, 0, 4,   0,   1,   0,   32,
+        8, 0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 255, 255, 255, 255,
+    };
     std::vector<std::byte> bytes(sizeof(pixels));
     std::memcpy(bytes.data(), pixels.data(), bytes.size());
     return bytes;
@@ -269,6 +280,27 @@ struct GltfFixture {
         WriteText(assets / "triangle.gltf", text);
     }
 
+    void UseParentRelativePaths() {
+        std::filesystem::create_directories(assets / "scenes");
+        std::filesystem::create_directories(assets / "buffers");
+        std::filesystem::copy_file(assets / "triangle.bin", assets / "buffers" / "triangle.bin",
+                                   std::filesystem::copy_options::overwrite_existing);
+
+        std::string text = TriangleGltf(true);
+        const std::string old_buffer = "\"uri\": \"triangle.bin\"";
+        const auto buffer_position = text.find(old_buffer);
+        REQUIRE(buffer_position != std::string::npos);
+        text.replace(buffer_position, old_buffer.size(), "\"uri\": \"../buffers/triangle.bin\"");
+
+        const std::string old_image = "\"images\": [{\"uri\": \"textures/checker.tga\"}]";
+        const auto image_position = text.find(old_image);
+        REQUIRE(image_position != std::string::npos);
+        text.replace(image_position, old_image.size(),
+                     "\"images\": [{\"uri\": \"../textures/checker.tga\"}]");
+
+        WriteText(assets / "scenes" / "triangle.gltf", text);
+    }
+
     void UseMaterialVariants() {
         std::string text = TriangleGltf(true);
         const std::string old_used = "\"extensionsUsed\": [\"KHR_lights_punctual\"],";
@@ -303,6 +335,34 @@ struct GltfFixture {
                      "[{\"material\": 1, \"variants\": [0]}]}},\n");
 
         WriteText(assets / "variants.gltf", text);
+    }
+
+    void UseTextureTransform(bool shared) {
+        std::string text = TriangleGltf(true);
+        const std::string old_used = "\"extensionsUsed\": [\"KHR_lights_punctual\"],";
+        const auto used_position = text.find(old_used);
+        REQUIRE(used_position != std::string::npos);
+        text.replace(used_position, old_used.size(),
+                     "\"extensionsUsed\": [\"KHR_lights_punctual\", "
+                     "\"KHR_texture_transform\"],");
+
+        const std::string transform =
+            "\"extensions\": {\"KHR_texture_transform\": {\"offset\": [0.25, 0.5], "
+            "\"rotation\": 1.5707964, \"scale\": [2.0, 3.0]}}";
+        const std::string old_base = "\"baseColorTexture\": {\"index\": 0}";
+        const auto base_position = text.find(old_base);
+        REQUIRE(base_position != std::string::npos);
+        text.replace(base_position, old_base.size(),
+                     "\"baseColorTexture\": {\"index\": 0, " + transform + "}");
+        if (shared) {
+            const std::string old_normal = "\"normalTexture\": {\"index\": 1}";
+            const auto normal_position = text.find(old_normal);
+            REQUIRE(normal_position != std::string::npos);
+            text.replace(normal_position, old_normal.size(),
+                         "\"normalTexture\": {\"index\": 1, " + transform + "}");
+        }
+
+        WriteText(assets / "transform.gltf", text);
     }
 
     void UseScenes() {
@@ -589,6 +649,151 @@ TEST_CASE("glTF importer builds mesh material scene skin morph and animation") {
     }
     CHECK(has_weights);
     CHECK(has_translation);
+}
+
+TEST_CASE("glTF importer resolves parent-relative external paths inside the project") {
+    GltfFixture fixture;
+    fixture.UseParentRelativePaths();
+    auto importers = parcel::import::CreateStandardImporterRegistry();
+    REQUIRE(importers);
+    const auto* importer = importers.Value().FindForExtension(".gltf");
+    REQUIRE(importer != nullptr);
+    const auto settings = parcel::import::MakeDefaultImportSettings("gltf", "windows");
+
+    auto imported = importer->Import(Request(fixture, "scenes/triangle.gltf", settings));
+    REQUIRE(imported);
+    CHECK(imported.Value().warnings.empty());
+    const auto* mesh = dynamic_cast<const MeshAsset*>(FindAsset(imported.Value(), "mesh"));
+    REQUIRE(mesh != nullptr);
+    CHECK(mesh->vertices.size() == 3);
+    const auto* material =
+        dynamic_cast<const MaterialAsset*>(FindAsset(imported.Value(), "material"));
+    REQUIRE(material != nullptr);
+    CHECK_FALSE(material->base_color_texture.texture.IsZero());
+
+    std::filesystem::remove(fixture.assets / "triangle.gltf");
+    std::filesystem::remove(fixture.assets / "triangle.glb");
+    std::filesystem::remove(fixture.assets / "triangle.bin");
+    parcel::import::ImportOptions options;
+    options.project_root = Utf8(fixture.project);
+    options.source_root = Utf8(fixture.assets);
+    options.output_root = Utf8(fixture.directory.Path() / "cooked");
+    options.db_path = Utf8(fixture.directory.Path() / "import.db");
+    options.target = "windows";
+    options.jobs = 1;
+
+    auto first = parcel::import::RunImport(options, importers.Value());
+    REQUIRE(first);
+    CHECK(first.Value().failed == 0);
+    CHECK(first.Value().imported == 3);
+
+    auto texture_meta = parcel::import::LoadAssetMetaFile(
+        Utf8(fixture.assets / "textures" / "checker.tga.parcelmeta"));
+    REQUIRE(texture_meta);
+    REQUIRE(texture_meta.Value().assets.size() == 1);
+    const AssetGuid texture_guid = texture_meta.Value().assets[0].guid;
+    auto gltf_meta = parcel::import::LoadAssetMetaFile(
+        Utf8(fixture.assets / "scenes" / "triangle.gltf.parcelmeta"));
+    REQUIRE(gltf_meta);
+    CHECK(std::find(gltf_meta.Value().dependencies.begin(), gltf_meta.Value().dependencies.end(),
+                    texture_guid) != gltf_meta.Value().dependencies.end());
+
+    auto second = parcel::import::RunImport(options, importers.Value());
+    REQUIRE(second);
+    CHECK(second.Value().failed == 0);
+    CHECK(second.Value().imported == 0);
+    CHECK(second.Value().skipped == 3);
+}
+
+TEST_CASE("glTF importer bakes KHR_texture_transform into UV0") {
+    GltfFixture fixture;
+    fixture.UseTextureTransform(true);
+    auto importers = parcel::import::CreateStandardImporterRegistry();
+    REQUIRE(importers);
+    const auto* importer = importers.Value().FindForExtension(".gltf");
+    REQUIRE(importer != nullptr);
+    const auto settings = parcel::import::MakeDefaultImportSettings("gltf", "windows");
+
+    auto imported = importer->Import(Request(fixture, "transform.gltf", settings));
+    REQUIRE(imported);
+    CHECK(imported.Value().warnings.empty());
+    const auto* mesh = dynamic_cast<const MeshAsset*>(FindAsset(imported.Value(), "mesh"));
+    REQUIRE(mesh != nullptr);
+    REQUIRE(mesh->vertices.size() == 3);
+    CHECK(mesh->vertices[0].texcoord0.x == Catch::Approx(0.25f));
+    CHECK(mesh->vertices[0].texcoord0.y == Catch::Approx(0.5f));
+    CHECK(mesh->vertices[1].texcoord0.x == Catch::Approx(0.25f));
+    CHECK(mesh->vertices[1].texcoord0.y == Catch::Approx(2.5f));
+    CHECK(mesh->vertices[2].texcoord0.x == Catch::Approx(-2.75f));
+    CHECK(mesh->vertices[2].texcoord0.y == Catch::Approx(0.5f));
+}
+
+TEST_CASE("texture decode bakes KHR_texture_transform into texels") {
+    const auto settings = parcel::import::MakeDefaultImportSettings("texture", "windows");
+    parcel::import::TextureBakeOptions bake;
+    bake.transform.offset = parcel::Vec2{0.5f, 0.0f};
+    auto decoded = parcel::import::DecodeTextureAsset(HorizontalTga(), settings, "pattern", &bake);
+    REQUIRE(decoded);
+    const auto& texture = *decoded.Value();
+    CHECK(texture.format == parcel::assets::TextureFormat::RGBA8);
+    REQUIRE(texture.mips.size() == 3);
+    REQUIRE(texture.mips[0].width == 4);
+    REQUIRE(texture.mips[0].height == 1);
+    REQUIRE(texture.mips[0].row_pitch == 16);
+
+    const auto channel = [&](std::size_t x, std::size_t component) {
+        return std::to_integer<int>(texture.mips[0].data[x * 4 + component]);
+    };
+    CHECK(channel(0, 0) == 0);
+    CHECK(channel(0, 1) == 0);
+    CHECK(channel(0, 2) == 255);
+    CHECK(channel(0, 3) == 255);
+    CHECK(channel(1, 0) == 255);
+    CHECK(channel(1, 1) == 255);
+    CHECK(channel(1, 2) == 255);
+    CHECK(channel(2, 0) == 255);
+    CHECK(channel(2, 1) == 0);
+    CHECK(channel(2, 2) == 0);
+    CHECK(channel(3, 0) == 0);
+    CHECK(channel(3, 1) == 255);
+    CHECK(channel(3, 2) == 0);
+}
+
+TEST_CASE("glTF importer bakes KHR_texture_transform into per-texture images") {
+    GltfFixture fixture;
+    fixture.UseTextureTransform(false);
+    auto importers = parcel::import::CreateStandardImporterRegistry();
+    REQUIRE(importers);
+    const auto* importer = importers.Value().FindForExtension(".gltf");
+    REQUIRE(importer != nullptr);
+    const auto settings = parcel::import::MakeDefaultImportSettings("gltf", "windows");
+
+    auto imported = importer->Import(Request(fixture, "transform.gltf", settings));
+    REQUIRE(imported);
+    CHECK(imported.Value().warnings.empty());
+    const auto* mesh = dynamic_cast<const MeshAsset*>(FindAsset(imported.Value(), "mesh"));
+    REQUIRE(mesh != nullptr);
+    REQUIRE(mesh->vertices.size() == 3);
+    CHECK(mesh->vertices[0].texcoord0 == parcel::Vec2{0.0f, 0.0f});
+    CHECK(mesh->vertices[1].texcoord0 == parcel::Vec2{1.0f, 0.0f});
+    CHECK(mesh->vertices[2].texcoord0 == parcel::Vec2{0.0f, 1.0f});
+
+    const auto* material = SceneMaterial(imported.Value());
+    REQUIRE(material != nullptr);
+    CHECK(material->base_color_texture.uv_set == 0);
+    CHECK(material->normal_texture.uv_set == 0);
+    CHECK(material->base_color_texture.texture != material->normal_texture.texture);
+    const auto* baked_asset = FindCooked(imported.Value(), "texture");
+    REQUIRE(baked_asset != nullptr);
+    CHECK(material->base_color_texture.texture == baked_asset->guid);
+
+    const auto* baked_texture =
+        dynamic_cast<const parcel::assets::TextureAsset*>(baked_asset->object.get());
+    REQUIRE(baked_texture != nullptr);
+    CHECK(baked_texture->sRGB);
+    REQUIRE(baked_texture->mips.size() == 1);
+    CHECK(baked_texture->mips[0].width == 1);
+    CHECK(baked_texture->mips[0].height == 1);
 }
 
 TEST_CASE("glTF importer selects KHR_materials_variants") {

@@ -1,4 +1,4 @@
-﻿# 03 资产与 Scene/ECS Schema
+# 03 资产与 Scene/ECS Schema
 
 ## 1. 基础类型
 
@@ -323,6 +323,8 @@ struct AnimationChannel {
 | ReflectionProbeComponent | hdrp ReflectionProbe 全字段，image 改 AssetGuid |
 | LocalFogVolumeComponent | hdrp LocalFogVolume 全字段，mask image 改 AssetGuid |
 | AudioSourceComponent | clip GUID / volume / pitch / loop / playOnAwake / spatial / min-max distance / rolloff |
+| AudioSourceMixComponent | bus / priority / occlusion enable-gain-lowpass-highFrequency |
+| AudioReverbZoneComponent | half extents / preset / priority / transition seconds / enabled |
 | AudioListenerComponent | enabled |
 | RigidBodyComponent | motion type / mass / drag / angularDrag / gravity / constraints / interpolation |
 | ColliderComponent | shape / size / offset / trigger / friction / restitution / layer / mask |
@@ -504,6 +506,8 @@ ComponentChunk:
 | 13 | AnimationPlayerComponent | 1 |
 | 14 | SkinComponent | 1 |
 | 15 | MorphComponent | 1 |
+| 16 | AudioSourceMixComponent | 1 |
+| 17 | AudioReverbZoneComponent | 1 |
 
 - `ComponentCodec<T>` 提供类型、名称、schema_version、`Encode`、`Decode`。
 - `ComponentRegistry` 接受自定义 `ComponentTypeInfo`，可附加

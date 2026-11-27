@@ -3,6 +3,7 @@
 #include "parcel/core/cancellation.hpp"
 #include "parcel/core/error.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -100,6 +101,7 @@ class OperationBase {
     void OnChildCompleted(OperationBase& child);
     [[nodiscard]] bool AllChildrenDone() const noexcept;
 
+    std::atomic<bool> start_guard_{false};
     OperationStatus status_ = OperationStatus::None;
     OperationStatus requested_status_ = OperationStatus::Succeeded;
     Error last_error_{ErrorCode::Ok};

@@ -56,6 +56,8 @@ class BundleLoader final {
 
     [[nodiscard]] core::Result<std::vector<std::byte>> ReadPayload(std::uint32_t payload_id);
     [[nodiscard]] core::Result<std::vector<std::byte>> ReadRawFile(std::string_view name);
+    [[nodiscard]] core::Result<std::vector<std::byte>>
+    ReadRawFileRange(std::string_view name, std::uint64_t offset, std::uint64_t size);
 
   private:
     struct Impl;

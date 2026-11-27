@@ -17,3 +17,5 @@ deploy/certs/*
 
 
 dist/
+test-results/
+playwright-report/

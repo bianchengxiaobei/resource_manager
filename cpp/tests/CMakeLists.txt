@@ -73,7 +73,9 @@ if(TARGET parcel_entt)
 endif()
 
 if(TARGET parcel_hbg)
-    list(APPEND PARCEL_TEST_SOURCES unit/test_hbg.cpp)
+    list(APPEND PARCEL_TEST_SOURCES unit/test_hbg.cpp unit/test_heightmap_tile_cache.cpp
+        unit/test_river.cpp unit/test_terrain_lod.cpp unit/test_vegetation.cpp
+        unit/test_water_surface.cpp)
     list(APPEND PARCEL_TEST_LIBS parcel_hbg)
 endif()
 

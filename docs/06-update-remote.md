@@ -178,7 +178,10 @@ auto url_provider = std::make_shared<SignedUrlProvider>(
 - 显式 Downloader 与按需下载共享按临时路径的 in-flight gate，同一 Bundle 等待 owner 完成；
   不再各自下载后再靠缓存复查。
   R07 不包含生产签名密钥。
-- 自动测试使用 MockTransport；WinHTTP 真实网络 smoke 需宿主环境。
+- 自动测试使用 MockTransport；WinHTTP loopback、真实 CDN/TLS 传输、完整安装和
+  真实 Parcel 服务端签名 URL smoke 已分别由 `run-winhttp-smoke.ps1`、
+  `run-cdn-smoke.ps1`、`run-cdn-bundle-smoke.ps1` 和
+  `run-signed-url-smoke.ps1` 覆盖。CDN 边缘签名转发仍需宿主 CDN 配置。
 
 
 

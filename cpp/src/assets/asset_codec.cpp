@@ -150,6 +150,60 @@ Result<std::shared_ptr<AssetObject>> DecodeAssetBytes(std::span<const std::byte>
     return DecodeAsset(reader, registry, resolver);
 }
 
+Result<DecodedAssetFile> DecodeAssetFileBytes(std::span<const std::byte> data,
+                                              const TypeRegistry& registry,
+                                              IObjectResolver* resolver, bool verify_content_hash) {
+    auto opened = serialize::AssetFileReader::Open(data, verify_content_hash);
+    if (!opened) {
+        return std::move(opened).TakeError();
+    }
+    serialize::AssetFileReader reader = std::move(opened).Value();
+    PARCEL_TRY(reader.ReadAll(verify_content_hash));
+    if (reader.Objects().empty()) {
+        return MakeError(ErrorCode::Corrupt, "asset file has no objects");
+    }
+
+    DecodedAssetFile decoded;
+    decoded.objects.reserve(reader.Objects().size());
+    decoded.local_ids.reserve(reader.Objects().size());
+    ReadContext context(reader, resolver);
+    for (const auto& object : reader.Objects()) {
+        const ITypeSerializer* serializer = registry.Find(object.type_id);
+        if (serializer == nullptr) {
+            return MakeError(ErrorCode::Unsupported, "unknown asset type id");
+        }
+        bool declared = false;
+        for (const auto& type : reader.Types()) {
+            if (type.type_id == object.type_id &&
+                type.serializer_version == serializer->Version()) {
+                declared = true;
+                break;
+            }
+        }
+        if (!declared) {
+            return MakeError(ErrorCode::Unsupported, "unsupported asset serializer version");
+        }
+        serialize::BinaryReader metadata(object.metadata);
+        auto asset = serializer->Deserialize(metadata, context);
+        if (!asset) {
+            return std::move(asset).TakeError();
+        }
+        if (!metadata.IsAtEnd()) {
+            return MakeError(ErrorCode::Corrupt, "asset metadata has trailing bytes");
+        }
+        if (asset.Value()->Type() != object.type_id) {
+            return MakeError(ErrorCode::Corrupt, "asset object type does not match its serializer");
+        }
+        decoded.objects.push_back(std::move(asset).Value());
+        decoded.local_ids.push_back(object.local_id);
+    }
+    decoded.sub_asset_ids.reserve(reader.SubAssets().size());
+    for (const auto& sub_asset : reader.SubAssets()) {
+        decoded.sub_asset_ids.push_back(sub_asset.local_object_id);
+    }
+    return decoded;
+}
+
 Result<std::vector<std::byte>> EncodeAssetBytes(const AssetObject& object,
                                                 const TypeRegistry& registry) {
     PARCEL_TRY_DECL(serialize::AssetFileDesc, desc, EncodeAsset(object, registry));

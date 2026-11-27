@@ -1,4 +1,4 @@
-﻿# Parcel
+# Parcel
 
 Parcel 是独立于 Hobi 引擎的资源管线项目，覆盖：
 
@@ -170,43 +170,57 @@ R04 打包管线、R05 Runtime 核心、R06 EnTT/hbg 适配主体、R07 热更/�
 - glTF/GLB（内置 cgltf）：mesh/material/node/camera/KHR_lights_punctual、skin、morph targets、
   TRS/Weights 动画、sidecar 覆盖；external buffer/image、embedded image 子资产、
   texture sampler（wrap/filter）、`KHR_materials_variants`、`EXT_meshopt_compression`、
-  scene 选择与纹理 canonical 复用。
+  `KHR_texture_transform`（共享 UV0 网格烘焙/逐贴图纹理变体）、scene 选择与纹理
+  canonical 复用。
 - `parcel_import` CLI：`--project --source --output --db --jobs`，输出
   `<guid>.prca` + `import_report.json`；支持并行导入和失败回滚。
-- `parcel_pack`：collector（main/static/depend、目录/显式列表、地址/标签/共享策略）、
-  ExternalRefTable 依赖分析、共享/Shader/Raw Bundle、PRCL/PRCM、`build_report.json`、
-  `build_db.json`、`builtin_catalog.bin`、增量复用和 `--clean`。
-- `parcel_pack` CLI：`--project --package --version --target --cooked --output --config`；
+- `parcel_pack`：collector（main/static/depend、目录/显式列表/`include`/`exclude` glob、
+  地址/标签/共享策略/archive raw）、ExternalRefTable 依赖分析、共享/Shader/Raw/Archive Bundle、PRCL/PRCM、`build_report.json`、
+  `build_db.json`、`builtin_catalog.bin`、Bundle/文件级增量复用、`--clean` 和可选 `--verify-output`；扫描 `.parcelmeta`
+  映射源路径，并将同源 Main/SubAsset 强制归入同一 Bundle。
+- `parcel_pack` CLI：`--project --package --version --target --source --cooked --output --config`（JSON/TOML）、`--verify-output`；
   输出 `<target>/<package>/<version>/bundles`、`manifest.bytes/hash`、version 文件。
 - `parcel_runtime`：AssetSystem/ResourcePackage、Builtin/Sandbox/Custom FileSystem、
   PRCL BundleLoader、Handle/Provider 去重与引用计数、PRCA 多对象/子资源解码、
   IObjectResolver、sync/async 加载、LoadScene/UnloadScene 场景生命周期、Unload/UnloadAll、
-  BuiltinCatalog、LoadingLock、缓存 sidecar、诊断/泄漏报告和全量 API 错误表面。
+  BuiltinCatalog、LoadingLock、缓存 sidecar、诊断/泄漏报告、Builtin Bundle 解包、外部 Bundle
+  导入和全量 API 错误表面。
 - `parcel_runtime` 支持按 `bundles/<file_name>` 查找 pack 输出，校验
   size/SHA-256/CRC32；Sandbox 缓存损坏会删除，并在配置下载器时按需重下修复。
+- `ResourceUnpacker` 将 builtin Bundle 解包到 Sandbox/Custom file system，`ResourceImporter`
+  按 bundle name/GUID 导入外部 `.bundle`；两者支持 tags/并发/进度/取消，写入前校验
+  size/SHA-256/CRC32，temp 原子安装。
 - `parcel_entt`：`EnttSceneLoader`、组件注册表、两阶段实例化/回滚/卸载；
   Runtime SceneHandle 在最后一个共享句柄释放时销毁实体并释放依赖 Bundle。
 - `parcel_hbg`：Texture/Mesh/Material Materializer、ParcelMaterialSystem（含
   per-texture sampler 上传）、ShaderLibraryBootstrap、SceneRenderBridge（含节点层级、
   object/camera/light nodeIndex、动画 channel/蒙皮/morph weights 映射、Light cookie/IES 采样）、
-  SettingsBridge；真实 ForwardRenderer 与 bgfx 设备端到端 smoke 待宿主验证。
+  SettingsBridge；`parcel_hbg_gpu_smoke` 已在 Windows/D3D12/D3D11/Vulkan 用合成场景和
+  `--package` 真实包资产验证 ForwardRenderer/ShaderLibrary 与完整 mip/BC7/RGBA16F 上传，
+  包内 ShaderLibraryAsset 经 Bootstrap 内容寻址物化（blob 跨版本复用，硬链接/复制回退）后驱动真实 dxbc/spirv 库；另在 D3D12 用
+  `--objects=10000` 验证静态实例扩展；Proland 60067-node 真实资产按原始 `../../assets`
+  布局（staging）完成 79 assets / 168MB bundle 导入打包，并在 D3D12/D3D11/Vulkan 渲染
+  （15449 draws / 1.56M triangles）；静态 mesh/material 已按 GUID 去重；轻量
+  `fractal_lod` 场景在 D3D11 800x450 以 3 组 120 帧通过绝对 60 fps 门禁
+  （Parcel 1.634ms vs hdrp 7.304ms）。
 - `parcel_remote`：RemoteConfig/版本决策/灰度、Manifest hash+bytes 缓存与原子切换、
   多 CDN/Token、`SignedUrlProvider` 服务端签名 URL 缓存/403 重签、`ManifestCache`、`RemoteManifestService`、Windows WinHTTP 后端。
 - `parcel_runtime` 下载：并发/每帧请求配额、无进度 watchdog、Range 续传、退避重试、暂停/取消/RetryFailed、
   原子安装、按需下载/缓存修复、OldVersions 清理。
 - `parcel-server`：Go 标准库路由 + 纯 Go SQLite、内容寻址 blob、bcrypt Session+CSRF、
-  设备 JWT、HMAC 签名 URL、包/版本/渠道/灰度/回滚/审计、Prometheus 指标、限流、
+  设备 JWT、HMAC 签名 URL、包/版本/渠道/灰度/回滚/重命名/删除/审计、Prometheus 指标、限流、
   OpenAPI 与 Docker/nginx/backup。
-- `parcel-admin`：`upload/publish/rollback/gray/backup`。
+- `parcel-admin`：`upload/publish/rollback/rename-package/delete-package/rename-version/delete-version/gray/gray-update/gray-delete/backup/restore`。
 - `parcel-admin-web`：Vue 3 + TypeScript + Vite + Element Plus，OpenAPI 生成 TS 类型。
 - 边界/版本/CRC/SHA-256 校验、golden files、截断/随机 fuzz 测试；
   ASan/UBSan/no-exceptions 构建通过。
 
 R09 稳固化基线已完成：独立 PRCA/PRCL/PRCM + sidecar/config fuzz 目标、安全边界测试、并发/重入
-压力测试、分帧卸载预算、MSVC ASan、ClangCL UBSan、Release 性能基准和发布打包脚本已加入。剩余项包括 
-TSan 实机验证、真实 CDN/TLS/吞吐、Docker/nginx smoke、Playwright、
-大规模下载基准、R06 的真实 bgfx ForwardRenderer/ShaderLibrary 端到端验证、
-R07 的真实 CDN/TLS、R08 的 Docker/真实 CDN 网络 smoke/Playwright。
+压力测试、分帧卸载预算、MSVC ASan、ClangCL UBSan、Release 性能基准、真实 CDN/TLS
+传输/完整安装 smoke、真实服务端签名 URL smoke、大规模 loopback 下载基准、Playwright
+管理端和 Windows nginx TLS 代理 smoke 和发布打包脚本已加入。剩余项包括 TSan 实机验证
+（Windows 工具链不支持，需 Linux/CI）、真实 CDN 边缘签名/鉴权流程、Docker 容器启动、
+R06 terrain GPU shader 顶点变形/material tiles/GPU FFT 纹理/GPU river particles（baked terrain LOD 选择、heightmap tile cache 的精确 node bounds/ground、CPU shared-grid 顶点变形、1km mesh + 500m submesh 的 60k vegetation frustum/5000m 距离剔除和 near/far LOD、CPU water FFT、CPU river mesh/terrain carve、river material 纹理、逐帧 wave normal、屏幕空间 Poisson foam 播种和 CPU foam 逐帧动画已支持）。
 
 
 

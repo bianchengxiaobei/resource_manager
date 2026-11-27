@@ -1,12 +1,14 @@
-﻿# R05 Runtime 核心
+# R05 Runtime 核心
 
 状态：完成（2026-11-22）。已实现 `parcel_runtime`、Builtin/Sandbox/Custom
 FileSystem、BundleLoader/Handle/Provider、PRCA 多对象/子资源、Resolver、同步/异步
 加载、LoadingLock、UnloadAll、缓存 sidecar、诊断/泄漏报告和测试。
 Scene 实例化/卸载已接入 R06 `ISceneLoader`；BuiltinCatalog 已加载并支持无 catalog 回退；
-下载修复/断点续传依赖 R07；覆盖安装 footprint 已实现。
-当前测试：206 cases / 5803 assertions；Debug/Release/no-exceptions/ASan/
-exceptions/no-assimp 构建通过。
+下载修复/断点续传依赖 R07；覆盖安装 footprint 已实现；Unpacker/Importer 已实现
+builtin Bundle 解包与外部 Bundle 导入，支持 tags/并发/进度/取消和原子安装。
+`EditorSimulate` 支持松散 cooked PRCA 直接加载、依赖递归、Raw/Scene 和异步加载。
+当前测试：Debug 284 cases / 15730 assertions，Release 282 cases / 13072 assertions；
+Debug/Release 构建通过。
 
 ## 目标
 
@@ -35,6 +37,11 @@ R01、R02。
 - [x] 多 Package、优先级、独立 Manifest/Cache。
 - [x] LoadingLock；UnloadAllAssets/DestroyPackage 等待在途操作。
 - [x] 每帧 `Update` 驱动 OperationScheduler，默认 4ms 预算。
+- [x] `PlayMode`：`Auto`/`EditorSimulate`/`Offline`/`Host`；`Auto` 保持旧行为。
+- [x] `Offline`：仅 Builtin，拒绝 Sandbox/Custom/下载配置。
+- [x] `Host`：Builtin（可选）+ Sandbox，要求 `sandbox_root`。
+- [x] `EditorSimulate`：扫描 `simulate_root`，直接加载松散 cooked PRCA；
+      支持依赖/子资产/Raw/Scene，Bundle/Downloader/Cache/Unpacker/Importer 返回 Unsupported。
 
 ### FileSystem
 
@@ -67,7 +74,7 @@ R01、R02。
 ### 全量 API
 
 - [x] LoadAsset/LoadSubAssets/LoadAllAssets（Sync/Async、模板 + TypeId）。
-- [x] LoadRawFile/LoadBundleFile。
+- [x] LoadRawFile/OpenRawFile/LoadBundleFile（含 archive raw range）。
 - [x] LoadScene/UnloadScene：经 R06 `ISceneLoader` 实例化/销毁；无 loader 返回 Unsupported。
 - [x] GetAllAssetInfos/ByTag/ByGuid/IsLocationValid/GetDownloadSize。
 - [x] UnloadAllAssets/UnloadUnusedAssets/TryUnloadUnusedAsset。

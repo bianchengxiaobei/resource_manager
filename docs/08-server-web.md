@@ -1,4 +1,4 @@
-﻿# 08 Go 服务端与 Vue 管理端
+# 08 Go 服务端与 Vue 管理端
 
 ## 1. 服务端定位
 
@@ -11,10 +11,10 @@
 
 ## 2. 技术栈
 
-- Go 1.22+；`chi`/`gin`（推荐 chi）或标准库。
+- Go 1.22+；标准库 `net/http` ServeMux（method/path patterns）。
 - SQLite：`modernc.org/sqlite`（纯 Go）或 `mattn/go-sqlite3`。
 - Auth：`golang-jwt/jwt`、Argon2/bcrypt、HMAC-SHA256。
-- OpenAPI 3.1；Go 使用 `oapi-codegen`。
+- OpenAPI 3.1；Go 端以契约测试校验路由/JSON 字段，Vue 使用 `openapi-typescript`。
 - 指标：Prometheus；结构化日志（slog）。
 - Vue 3 + TypeScript + Vite + Element Plus；OpenAPI 生成 TS client。
 
@@ -37,6 +37,9 @@ audit_logs        （id, user_id, action, target, detail, created_at）
 - 上传时校验 SHA-256；先写临时文件再原子 rename。
 - 版本状态：`draft → published → rolled_back`。
 - 回滚只切 channel 指针，不删除旧 artifact。
+- 包重命名会同步更新 manifest/hash artifact 名；版本重命名会同步更新版本与 artifact 名。
+- 版本删除拒绝仍被 channel 或灰度规则引用的版本；包删除级联版本/渠道/灰度规则，
+  并清理无引用的 blob。
 
 ## 4. API
 
@@ -55,10 +58,15 @@ GET  /files/{path}?expires=&key_id=&signature=
 ```text
 POST /api/v1/admin/login
 POST /api/v1/admin/logout
-GET  /api/v1/admin/packages
-POST /api/v1/admin/packages
-POST /api/v1/admin/packages/{pkg}/versions
-POST /api/v1/admin/packages/{pkg}/versions/{ver}/publish
+GET    /api/v1/admin/packages
+POST   /api/v1/admin/packages
+PATCH  /api/v1/admin/packages/{pkg}
+DELETE /api/v1/admin/packages/{pkg}?confirm={pkg}
+GET    /api/v1/admin/packages/{pkg}/versions
+POST   /api/v1/admin/packages/{pkg}/versions
+PATCH  /api/v1/admin/packages/{pkg}/versions/{ver}
+DELETE /api/v1/admin/packages/{pkg}/versions/{ver}?confirm={ver}
+POST   /api/v1/admin/packages/{pkg}/versions/{ver}/publish
 POST /api/v1/admin/packages/{pkg}/rollback
 GET  /api/v1/admin/packages/{pkg}/channels
 PUT  /api/v1/admin/packages/{pkg}/channels/{channel}
@@ -147,8 +155,12 @@ docker-compose:
 
 - Go：httptest + 临时 SQLite；上传/发布/回滚/灰度/签名 URL/401/403。
 - 签名 URL 过期、密钥轮换、路径穿越、限流。
-- Vue：Playwright 登录/上传/发布/回滚 smoke（可选）。
-- 部署：docker-compose 启动、健康检查、备份恢复。
+- Vue：Playwright smoke 使用系统 Edge headless 覆盖登录、创建包、上传两个版本、
+  发布、回滚、创建/编辑/删除灰度规则、审计分页/指标页和登出
+  （`server/web/e2e/admin.spec.ts` + `scripts/run-webui-smoke.ps1`）。
+- nginx：Windows nginx 1.27.5 + 本地 CA 签发证书，`scripts/run-nginx-smoke.ps1`
+  验证 HTTP→HTTPS、HTTPS `/healthz`、静态 UI、管理员登录和建包代理，并用 Go TLS
+  probe 校验证书链和主机名；Docker 容器启动和公网受信任证书仍未验证。
 ## 11. R08 当前实现
 
 状态：主体完成。服务端、管理端、CLI、OpenAPI、Docker 部署文件已落地。
@@ -226,13 +238,32 @@ Docker 构建顺序为 Vue build → Go build → distroless 运行镜像。
 
 ### 11.5 管理端
 
-- 登录/登出/CSRF；包列表/新建；版本列表/上传（进度）/发布；渠道选择；
-  灰度规则创建/编辑/删除；回滚；审计分页；指标概览。
+- 登录/登出/CSRF；包列表/新建/重命名/删除；版本列表/上传（进度）/发布/重命名/删除；
+  渠道选择；灰度规则创建/编辑/删除；回滚；审计分页；指标概览。
 - 上传使用 `XMLHttpRequest` 显示进度，前后端均校验 manifest/header。
 - OpenAPI `api/openapi.yaml` 通过 `openapi-typescript` 生成
   `server/web/src/api/schema.d.ts`。
+- `parcel-admin` 支持包/版本重命名与删除、灰度规则更新/删除。
 
-### 11.6 运维
+### 11.6 契约校验
+
+`server/internal/api/openapi_test.go` 从 `server.go` 提取实际注册的 method/path，
+并与 `api/openapi.yaml` 双向比较；同时对 `Error`、`Package`、`Version`、`Channel`、
+`GrayRuleRequest`、`ClientConfig`、`ClientVersion`、`SignedURL` 等主要 schema 的
+顶层 JSON 字段与 Go struct tag 做对齐检查。
+
+```powershell
+cd server
+go test ./internal/api -run TestOpenAPI
+cd web
+npm run generate:api
+npm run build
+```
+
+TS schema 文件在生成后应无 diff；`npm run build` 同时执行 `vue-tsc --noEmit`。
+`/files/{path...}` 的 Go wildcard 路由在测试中归一化为 OpenAPI 的 `/files/{path}`。
+
+### 11.7 运维
 
 ```sh
 cd deploy
@@ -251,13 +282,12 @@ parcel-admin restore --backup backups/<timestamp> --db /data/parcel.db --blobs /
 Docker 镜像包含 `parcel-admin`；备份命令使用 SQLite `VACUUM INTO`，再复制不可变
 blobs。恢复时停止服务，替换 `parcel.db` 与 `blobs` 后启动。
 
-### 11.7 明确延后
+### 11.8 明确延后
 
-- 真实 Docker/nginx TLS 启动 smoke（当前环境无 Docker）。
-- Playwright UI smoke（可选）。
+- 真实 Docker 容器启动 smoke 和公网受信任 TLS 证书（当前环境无 Docker；Windows
+  nginx 本地 CA 证书链 smoke 已通过）。
 - 跨节点 PostgreSQL/S3、分布式锁、CDN 预热。
 - 大规模并发/断点压力测试；当前 API 测试覆盖 Range、限流、签名、路径穿越。
-- CLI `gray` 目前覆盖创建；更新/删除灰度规则走管理端或 API。
 
 
 

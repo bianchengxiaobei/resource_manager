@@ -1,4 +1,4 @@
-﻿#include "parcel/entt/scene_loader.hpp"
+#include "parcel/entt/scene_loader.hpp"
 
 #include "parcel/core/error.hpp"
 
@@ -190,6 +190,8 @@ const EnttComponentRegistry& StandardEnttComponentRegistry() {
                                 result.Register<parcel::scene::ReflectionProbeComponent>() &&
                                 result.Register<parcel::scene::LocalFogVolumeComponent>() &&
                                 result.Register<parcel::scene::AudioSourceComponent>() &&
+                                result.Register<parcel::scene::AudioSourceMixComponent>() &&
+                                result.Register<parcel::scene::AudioReverbZoneComponent>() &&
                                 result.Register<parcel::scene::AudioListenerComponent>() &&
                                 result.Register<parcel::scene::RigidBodyComponent>() &&
                                 result.Register<parcel::scene::ColliderComponent>() &&

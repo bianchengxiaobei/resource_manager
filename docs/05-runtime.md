@@ -1,4 +1,4 @@
-﻿# 05 Runtime
+# 05 Runtime
 
 ## 1. 核心对象
 
@@ -22,7 +22,7 @@ AssetSystem
 |---|---|
 | Package | Initialize / Destroy / RequestVersion / LoadManifest / PrefetchManifest / EnsureBundle |
 | Asset | LoadAsset / LoadSubAssets / LoadAllAssets（Sync/Async，模板 + TypeId） |
-| Raw/Bundle | LoadRawFile / LoadBundleFile |
+| Raw/Bundle | LoadRawFile / OpenRawFile / LoadBundleFile |
 | Scene | LoadScene / UnloadScene（依赖 `parcel_entt` + `ISceneLoader`） |
 | Info | GetAllAssetInfos / ByTag / ByGuid / IsLocationValid / GetDownloadSize |
 | Unload | UnloadAllAssets / UnloadUnusedAssets / TryUnloadUnusedAsset |
@@ -31,10 +31,48 @@ AssetSystem
 | Unpack/Import | ResourceUnpacker / ResourceImporter |
 | Multi-package | Create / Get / Destroy / Priority |
 | Custom | StartOperation(CustomAsyncOperation) |
-| Editor/Web | 接口保留，返回 `Unsupported` |
+| Web | 接口保留，返回 `Unsupported` |
 
 - 同步 API 仅建议工具/编辑器使用；主线程同步等待有死锁风险。
 - 不支持的 API 返回 `Unsupported` + 明确错误码，不删除接口。
+
+### 2.1 PlayMode
+
+`ResourcePackageOptions::play_mode` 显式选择运行模式，默认 `Auto` 保持旧行为：
+
+| 模式 | FileSystem 组合 | 说明 |
+|---|---|---|
+| `Auto` | `file_systems` 或 Builtin/Sandbox/Custom 根目录 | 兼容现有配置，不改变旧包行为 |
+| `EditorSimulate` | 松散 cooked PRCA + Manifest | 扫描 `simulate_root` 的 `.prca` 并按 GUID 直接加载；不走 PRCL/BundleLoader |
+| `Offline` | 仅 Builtin | 必须有 `builtin_root`；拒绝 Sandbox/Custom/下载配置 |
+| `Host` | Builtin（可选）+ Sandbox | 必须有 `sandbox_root`；拒绝 Custom |
+
+显式模式不接受 `file_systems` 自定义列表，避免组合歧义。`ResourcePackage::GetPlayMode()` 返回实际模式。
+
+```cpp
+parcel::runtime::ResourcePackageOptions options;
+options.package_name = "game";
+options.play_mode = parcel::runtime::PlayMode::Offline;
+options.builtin_root = "build/windows/game/1.0.0";
+auto package = system.CreatePackage(options);
+```
+
+`EditorSimulate` 示例：
+
+```cpp
+options.play_mode = parcel::runtime::PlayMode::EditorSimulate;
+options.builtin_root.clear();
+options.simulate_root = "build/cooked";
+options.simulate_manifest = "build/windows/game/1.0.0/manifest.bytes";
+```
+
+- `simulate_manifest` 为空时读取 `<simulate_root>/manifest.bytes`。
+- 初始化时递归扫描 `simulate_root` 下 `<guid>.prca`，建立 GUID → 文件路径索引；文件名必须是有效 GUID。
+- `LoadAsset/AllAssets/SubAssets/RawFile/Scene` 直接解析 PRCA；跨资产引用由直接文件 Resolver 递归加载。
+- 不创建 BundleLoader/FileSystemHost，不使用下载、缓存、sidecar 或 archive bundle。
+  `LoadBundleFile`、`EnsureBundle`、Downloader、缓存查询/校验/清理、Unpacker/Importer
+  返回 `Unsupported`。
+- 重新加载 Manifest 使用 `simulate_manifest`，但不会重新扫描资产目录。
 
 ## 3. Operation Scheduler
 
@@ -119,7 +157,9 @@ ResourceManager
   FileName/`bundles/` 定位；catalog 包名必须与 Package 名一致。无 catalog 的旧包
   回退目录探测；catalog 未列出的 Bundle 视为非内置。
 - SandboxFS：可写缓存；`CanAccept` 兜底 true；Host 模式顺序 `[Builtin, Sandbox]`。
-- CustomFS：DLC/MOD/自定义挂载。
+- CustomFS：DLC/MOD/自定义挂载；仅在 `Auto` 模式使用。
+- 显式 `Offline` 只构建 BuiltinFS；显式 `Host` 只构建 BuiltinFS + SandboxFS。
+  `EditorSimulate` 使用独立的松散 PRCA 扫描/直读路径，不创建 Sandbox。
 - 文件校验：size / CRC32 / SHA-256；下载必须 SHA-256。
 - 缓存 sidecar：magic/version/GUID/size/SHA-256/CRC/flags。
 - 写入：`.tmp` + 校验 + 原子 rename；失败删除临时文件。
@@ -201,6 +241,7 @@ system.Initialize(system_options);
 
 parcel::runtime::ResourcePackageOptions options;
 options.package_name = "game";
+options.play_mode = parcel::runtime::PlayMode::Offline;
 options.builtin_root = "build/windows/game/1.0.0";
 auto package = system.CreatePackage(options);
 
@@ -219,10 +260,20 @@ handle.Release();
 - Provider key 为 `asset_guid + load_method + requested_type_id`；BundleLoader
   按 `BundleGuid` 去重。Provider 按主 Bundle + asset/bundle 依赖递归加载，
   `IObjectResolver` 从已加载 Bundle 解码 ExternalRefTable 引用。
+- `EditorSimulate` 不创建 BundleLoader：初始化扫描 `simulate_root`，Provider
+  按 GUID 直接读取 PRCA；`SimulateResolver` 递归解析 ExternalRefTable 引用。
+  `asset_codec::DecodeAssetFileBytes` 统一支持多对象/子资源解码。
 - Handle 拷贝共享 `HandleState`；`Release()` 幂等。最后一个 Handle 释放
   Provider 引用；`auto_unload_bundle_when_unused` 默认关闭。
 - `UnloadAllAssets` / `DestroyPackage` 会释放现有 Handle（之后 `IsValid()` 为
   false）并等待在途 Provider 完成；新加载在 LoadingLock 期间返回失败。
+- `LoadRawFile` 支持两种 pack 形式：普通 PRCA `RawFileAsset` payload，以及
+  archive bundle 的 PRCL TOC `raw_files`。Archive raw 的 Manifest asset flag
+  为 `ArchiveRaw`，Provider 按 `assetPath` 从 TOC 读取原始 bytes，并构造
+  `RawFileAsset` 供 `Data()`/`GetObject()` 使用。`OpenRawFile` 返回 `RawFileReader`，
+  可同步读取 raw asset 的任意 range；archive raw 直接走 BundleLoader 的逻辑 range，
+  不创建 Provider 或复制完整 payload，非 archive raw 物化一次后从保留副本读取。
+  Reader 持有 bundle 引用，销毁时释放；Package `Destroy` 后读取失败。
 - `parcel_pack` 的 Bundle 位于版本目录的 `bundles/` 子目录；Builtin/Sandbox FS
   会先查找 `<root>/<file_name>`，再查找 `<root>/bundles/<file_name>`。
 - Sandbox sidecar 为 `<bundle>.cache`，包含 magic/version/GUID/size/SHA-256/CRC；
@@ -238,9 +289,14 @@ handle.Release();
 - `UnloadScene` 释放 SceneHandle；最后一个共享句柄释放时调用
   `ISceneLoader::Destroy`，随后释放 Provider 的依赖 Bundle。加载失败会清空
   Scene 对象并回滚 Bundle 引用。
-- R05 边界：覆盖安装 footprint 与
-  `OperationBase::Elapsed`/`DownloadSummary` 计时已实现；
-  Unpacker/Importer 保留接口并返回 `Unsupported`。
+- 覆盖安装 footprint 与 `OperationBase::Elapsed`/`DownloadSummary` 计时已实现。
+- `ResourceUnpacker`：`CreateUnpacker(UnpackOptions)` 从 builtin file system 将当前 Manifest
+  中缺失的 Bundle 复制到第一个支持导入的可写 Sandbox/Custom file system；支持 tags、
+  `max_concurrency`、进度和取消，复制前校验 size/SHA-256/CRC32，写入 temp 后原子安装。
+  不复制 Manifest/version 文件，Manifest 仍由 `FileSystemHost` 加载。
+- `ResourceImporter`：`CreateImporter(BundleImportOptions)` 按 bundle name 或 GUID 查找
+  Manifest 中的 Bundle，再将外部 `.bundle` 文件校验并导入可写 file system；支持多个文件、
+  并发、进度和取消，已缓存 Bundle 会跳过。空导入列表返回 `InvalidArgument`。
 
 
 

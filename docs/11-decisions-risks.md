@@ -75,6 +75,15 @@
 - YooAsset Apache-2.0 参考需 NOTICE；Unity 4.7 源码专有，不复制。
 - hdrp-bgfx/bgfx/assimp/bc7enc/stb_dxt/meshoptimizer 等许可证保留。
 
+### R10 KHR_texture_transform 的 UV0 子集
+
+- hdrp-bgfx 原 shader 对材质贴图只采样 `v_texcoord0`，`texCoord != 0` 无法在
+  不改 hdrp 的前提下表达。
+- 缓解：所有贴图 transform 一致时烘入 `TEXCOORD_0`；逐贴图 transform 不同时
+  在导入期按源图+transform+sampler+sRGB 生成纹理变体。代价是 cook 时间、纹理
+  内存和包体增加；`texCoord != 0` 仍保留原 UV0 并 warning。完整 UV1 支持需要
+  扩展 hdrp 材质/mesh UV 通道。
+
 ## 待定但不阻塞
 
 - 物理/音频/脚本具体 backend。

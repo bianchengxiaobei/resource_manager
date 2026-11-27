@@ -1,4 +1,4 @@
-﻿#include <catch_amalgamated.hpp>
+#include <catch_amalgamated.hpp>
 
 #include "parcel/assets/asset_codec.hpp"
 #include "parcel/assets/material_asset.hpp"
@@ -126,13 +126,15 @@ struct RuntimeFixture {
     AssetGuid texture_guid;
     AssetGuid scene_guid;
     AssetGuid raw_guid;
+    AssetGuid archive_second_raw_guid;
     std::string output_directory;
     std::string material_path;
     std::string scene_path;
     std::string raw_path;
+    std::string archive_second_raw_path;
     std::vector<std::string> bulk_raw_paths;
 
-    explicit RuntimeFixture(std::size_t extra_raw_assets = 0) {
+    explicit RuntimeFixture(std::size_t extra_raw_assets = 0, bool archive_raw = false) {
         std::filesystem::create_directories(cooked);
         REQUIRE(assets::RegisterStandardAssetSerializers(registry));
 
@@ -165,16 +167,22 @@ struct RuntimeFixture {
         raw.name = "payload";
         raw.data = {std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
         raw_guid = WriteAsset(cooked, "raw", "payload", raw, registry);
+        if (archive_raw) {
+            assets::RawFileAsset second;
+            second.name = "archive-payload";
+            second.data = {std::byte{5}, std::byte{6}, std::byte{7}};
+            archive_second_raw_guid =
+                WriteAsset(cooked, "raw", "archive-payload", second, registry);
+        }
 
         for (std::size_t i = 0; i < extra_raw_assets; ++i) {
             assets::RawFileAsset bulk;
             bulk.name = "bulk-" + std::to_string(i);
             bulk.data = {std::byte{1}, std::byte{2}, std::byte{3}};
-            const AssetGuid guid = WriteAsset(cooked, "bulk", "bulk-" + std::to_string(i), bulk,
-                                              registry);
+            const AssetGuid guid =
+                WriteAsset(cooked, "bulk", "bulk-" + std::to_string(i), bulk, registry);
             bulk_raw_paths.push_back("bulk/" + guid.ToHex() + ".prca");
         }
-
 
         pack::PackConfig config;
         config.project_root = ToUtf8(project);
@@ -205,6 +213,7 @@ struct RuntimeFixture {
         raw_collector.path = "raw";
         raw_collector.address_rule = pack::AddressRule::AssetPath;
         raw_collector.bundle = "raw";
+        raw_collector.archive = archive_raw;
         config.collectors.push_back(raw_collector);
 
         for (std::size_t i = 0; i < bulk_raw_paths.size(); ++i) {
@@ -226,6 +235,9 @@ struct RuntimeFixture {
         material_path = "a/" + material_guid.ToHex() + ".prca";
         scene_path = "a/" + scene_guid.ToHex() + ".prca";
         raw_path = "raw/" + raw_guid.ToHex() + ".prca";
+        if (archive_raw) {
+            archive_second_raw_path = "raw/" + archive_second_raw_guid.ToHex() + ".prca";
+        }
     }
 
     runtime::ResourcePackageOptions PackageOptions(std::string_view builtin_root = {}) const {
@@ -393,6 +405,113 @@ TEST_CASE("runtime loads raw and bundle files", "[runtime]") {
     system.Shutdown();
 }
 
+TEST_CASE("runtime loads raw files from an archive bundle", "[runtime]") {
+    RuntimeFixture fixture(0, true);
+    runtime::AssetSystem system;
+    REQUIRE(system.Initialize({}));
+    auto package = system.CreatePackage(fixture.PackageOptions());
+    REQUIRE(package);
+
+    auto raw = package.Value()->LoadRawFile(fixture.raw_path);
+    INFO(raw.LastError().ToString());
+    REQUIRE(raw.Status() == core::OperationStatus::Succeeded);
+    REQUIRE(raw.Data().size() == 4);
+    REQUIRE(raw.Data()[0] == std::byte{1});
+    REQUIRE(raw.Data()[3] == std::byte{4});
+    REQUIRE(raw.GetObject() != nullptr);
+    REQUIRE(raw.GetObject()->Type() == assets::kRawFileAssetType);
+
+    auto second = package.Value()->LoadRawFile(fixture.archive_second_raw_path);
+    INFO(second.LastError().ToString());
+    REQUIRE(second.Status() == core::OperationStatus::Succeeded);
+    REQUIRE(second.Data().size() == 3);
+    REQUIRE(second.Data()[0] == std::byte{5});
+    REQUIRE(second.Data()[2] == std::byte{7});
+
+    auto asset = package.Value()->LoadAsset(fixture.raw_path);
+    INFO(asset.LastError().ToString());
+    REQUIRE(asset.Status() == core::OperationStatus::Succeeded);
+    REQUIRE(asset.GetObject() != nullptr);
+    REQUIRE(asset.GetObject()->Type() == assets::kRawFileAssetType);
+    REQUIRE(asset.Data().size() == 4);
+
+    auto bundle = package.Value()->LoadBundleFile("raw");
+    REQUIRE(bundle.Status() == core::OperationStatus::Succeeded);
+    REQUIRE(bundle.Data().size() >= 128);
+
+    raw.Release();
+    second.Release();
+    asset.Release();
+    bundle.Release();
+    REQUIRE(system.DestroyPackage("game"));
+    system.Shutdown();
+}
+
+TEST_CASE("runtime reads archive raw file ranges", "[runtime]") {
+    RuntimeFixture fixture(0, true);
+    runtime::AssetSystem system;
+    REQUIRE(system.Initialize({}));
+    auto package = system.CreatePackage(fixture.PackageOptions());
+    REQUIRE(package);
+
+    auto reader = package.Value()->OpenRawFile(fixture.raw_path);
+    if (!reader) {
+        INFO(reader.GetError().ToString());
+    }
+    REQUIRE(reader);
+    REQUIRE(reader.Value()->Size() == 4);
+    REQUIRE(package.Value()->Stats().providers == 0);
+
+    auto all = reader.Value()->Read(0, 4);
+    if (!all) {
+        FAIL_CHECK(all.GetError().ToString());
+    }
+    REQUIRE(all);
+    REQUIRE(all.Value() ==
+            std::vector<std::byte>{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}});
+    auto middle = reader.Value()->Read(1, 2);
+    REQUIRE(middle);
+    REQUIRE(middle.Value() == std::vector<std::byte>{std::byte{2}, std::byte{3}});
+    auto empty = reader.Value()->Read(2, 0);
+    REQUIRE(empty);
+    REQUIRE(empty.Value().empty());
+
+    auto out_of_bounds = reader.Value()->Read(4, 1);
+    REQUIRE_FALSE(out_of_bounds);
+    REQUIRE(out_of_bounds.GetError().code == core::ErrorCode::InvalidArgument);
+
+    reader.Value().reset();
+    REQUIRE(system.DestroyPackage("game"));
+    system.Shutdown();
+}
+
+TEST_CASE("runtime reads non-archive raw file ranges", "[runtime]") {
+    RuntimeFixture fixture;
+    runtime::AssetSystem system;
+    REQUIRE(system.Initialize({}));
+    auto package = system.CreatePackage(fixture.PackageOptions());
+    REQUIRE(package);
+
+    auto reader = package.Value()->OpenRawFile(fixture.raw_path);
+    if (!reader) {
+        INFO(reader.GetError().ToString());
+    }
+    REQUIRE(reader);
+    REQUIRE(reader.Value()->Size() == 4);
+
+    auto middle = reader.Value()->Read(2, 2);
+    REQUIRE(middle);
+    REQUIRE(middle.Value() == std::vector<std::byte>{std::byte{3}, std::byte{4}});
+    auto out_of_bounds = reader.Value()->Read(3, 2);
+    REQUIRE_FALSE(out_of_bounds);
+    REQUIRE(out_of_bounds.GetError().code == core::ErrorCode::InvalidArgument);
+
+    reader.Value().reset();
+    (void)package.Value()->UnloadAllAssets();
+    REQUIRE(system.DestroyPackage("game"));
+    system.Shutdown();
+}
+
 TEST_CASE("sandbox app footprint cleans cache after an overwrite install", "[runtime]") {
     TempDir directory{"runtime_footprint"};
     const std::filesystem::path cache = directory.Path() / "cache";
@@ -535,6 +654,197 @@ TEST_CASE("runtime reports unsupported scene and downloader APIs", "[runtime]") 
     REQUIRE(downloader.GetError().code == core::ErrorCode::Unsupported);
 
     REQUIRE(system.DestroyPackage("game"));
+    system.Shutdown();
+}
+
+TEST_CASE("runtime supports explicit offline and host play modes", "[runtime][mode]") {
+    RuntimeFixture fixture;
+    runtime::AssetSystem system;
+    REQUIRE(system.Initialize({}));
+
+    auto offline_options = fixture.PackageOptions();
+    offline_options.play_mode = runtime::PlayMode::Offline;
+    auto offline = system.CreatePackage("game", offline_options);
+    REQUIRE(offline);
+    REQUIRE(offline.Value()->GetPlayMode() == runtime::PlayMode::Offline);
+    auto material = offline.Value()->LoadAssetSync<assets::MaterialAsset>(fixture.material_path);
+    INFO(material.LastError().ToString());
+    REQUIRE(material.Status() == core::OperationStatus::Succeeded);
+    material.Release();
+    auto downloader = offline.Value()->CreateDownloader();
+    REQUIRE_FALSE(downloader);
+    REQUIRE(downloader.GetError().code == core::ErrorCode::Unsupported);
+    REQUIRE(system.DestroyPackage("game"));
+
+    auto host_options = fixture.PackageOptions();
+    host_options.play_mode = runtime::PlayMode::Host;
+    host_options.sandbox_root = ToUtf8(fixture.directory.Path() / "host-sandbox");
+    auto host = system.CreatePackage("game", host_options);
+    REQUIRE(host);
+    REQUIRE(host.Value()->GetPlayMode() == runtime::PlayMode::Host);
+    auto host_material = host.Value()->LoadAssetSync<assets::MaterialAsset>(fixture.material_path);
+    INFO(host_material.LastError().ToString());
+    REQUIRE(host_material.Status() == core::OperationStatus::Succeeded);
+    host_material.Release();
+
+    REQUIRE(system.DestroyPackage("game"));
+    system.Shutdown();
+}
+
+TEST_CASE("runtime editor simulate loads loose cooked assets", "[runtime][mode][simulate]") {
+    RuntimeFixture fixture;
+    runtime::AssetSystem system;
+    REQUIRE(system.Initialize({}));
+
+    auto options = fixture.PackageOptions();
+    options.builtin_root.clear();
+    options.play_mode = runtime::PlayMode::EditorSimulate;
+    options.simulate_root = ToUtf8(fixture.cooked);
+    options.simulate_manifest = fixture.output_directory + "/manifest.bytes";
+    auto package = system.CreatePackage(options);
+    REQUIRE(package);
+    REQUIRE(package.Value()->GetPlayMode() == runtime::PlayMode::EditorSimulate);
+    REQUIRE(package.Value()->Host() == nullptr);
+    REQUIRE(package.Value()->ReloadManifest());
+
+    auto material = package.Value()->LoadAssetSync<assets::MaterialAsset>(fixture.material_path);
+    INFO(material.LastError().ToString());
+    REQUIRE(material.Status() == core::OperationStatus::Succeeded);
+    REQUIRE(material.Get<assets::MaterialAsset>()->base_color_texture.texture ==
+            fixture.texture_guid);
+    material.Release();
+
+    auto async = package.Value()->LoadAssetAsync<assets::MaterialAsset>(fixture.material_path);
+    Pump(system, async);
+    REQUIRE(async.Status() == core::OperationStatus::Succeeded);
+    async.Release();
+
+    auto raw = package.Value()->LoadRawFileSync(fixture.raw_path);
+    INFO(raw.LastError().ToString());
+    REQUIRE(raw.Status() == core::OperationStatus::Succeeded);
+    auto* raw_asset = raw.Get<assets::RawFileAsset>();
+    REQUIRE(raw_asset != nullptr);
+    REQUIRE(raw_asset->data ==
+            std::vector<std::byte>{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}});
+    raw.Release();
+
+    auto reader = package.Value()->OpenRawFile(fixture.raw_path);
+    REQUIRE(reader);
+    REQUIRE(reader.Value()->Size() == 4);
+    auto range = reader.Value()->Read(1, 2);
+    REQUIRE(range);
+    REQUIRE(range.Value() == std::vector<std::byte>{std::byte{2}, std::byte{3}});
+
+    auto scene_loader = std::make_shared<CountingSceneLoader>();
+    package.Value()->SetSceneLoader(scene_loader, nullptr);
+    auto scene = package.Value()->LoadScene(fixture.scene_path);
+    INFO(scene.LastError().ToString());
+    REQUIRE(scene.Status() == core::OperationStatus::Succeeded);
+    REQUIRE(scene_loader->instantiate_count == 1);
+    REQUIRE(package.Value()->UnloadScene(scene));
+    REQUIRE(scene_loader->destroy_count == 1);
+
+    auto bundle = package.Value()->LoadBundleFile("raw");
+    REQUIRE(bundle.Status() == core::OperationStatus::Failed);
+    REQUIRE(bundle.LastError().code == core::ErrorCode::Unsupported);
+    bundle.Release();
+    auto ensure = package.Value()->EnsureBundle("raw");
+    REQUIRE_FALSE(ensure);
+    REQUIRE(ensure.GetError().code == core::ErrorCode::Unsupported);
+    auto downloader = package.Value()->CreateDownloader();
+    REQUIRE_FALSE(downloader);
+    REQUIRE(downloader.GetError().code == core::ErrorCode::Unsupported);
+    auto query_cache = package.Value()->QueryCache();
+    REQUIRE_FALSE(query_cache);
+    REQUIRE(query_cache.GetError().code == core::ErrorCode::Unsupported);
+    auto clear_cache = package.Value()->ClearCache(runtime::CacheClearOptions{});
+    REQUIRE_FALSE(clear_cache);
+    REQUIRE(clear_cache.GetError().code == core::ErrorCode::Unsupported);
+    auto verify_cache = package.Value()->VerifyCacheFiles(runtime::CacheVerifyOptions{});
+    REQUIRE_FALSE(verify_cache);
+    REQUIRE(verify_cache.GetError().code == core::ErrorCode::Unsupported);
+    auto unpacker = package.Value()->CreateUnpacker();
+    REQUIRE_FALSE(unpacker);
+    REQUIRE(unpacker.GetError().code == core::ErrorCode::Unsupported);
+    auto importer = package.Value()->CreateImporter();
+    REQUIRE_FALSE(importer);
+    REQUIRE(importer.GetError().code == core::ErrorCode::Unsupported);
+
+    REQUIRE(system.DestroyPackage("game"));
+    system.Shutdown();
+}
+
+TEST_CASE("runtime editor simulate validates simulate configuration", "[runtime][mode][simulate]") {
+    RuntimeFixture fixture;
+    runtime::AssetSystem system;
+    REQUIRE(system.Initialize({}));
+
+    SECTION("missing simulate root") {
+        auto options = fixture.PackageOptions();
+        options.builtin_root.clear();
+        options.play_mode = runtime::PlayMode::EditorSimulate;
+        auto package = system.CreatePackage(options);
+        REQUIRE_FALSE(package);
+        REQUIRE(package.GetError().code == core::ErrorCode::InvalidArgument);
+    }
+
+    SECTION("builtin roots are rejected") {
+        auto options = fixture.PackageOptions();
+        options.play_mode = runtime::PlayMode::EditorSimulate;
+        options.simulate_root = ToUtf8(fixture.cooked);
+        options.simulate_manifest = fixture.output_directory + "/manifest.bytes";
+        auto package = system.CreatePackage(options);
+        REQUIRE_FALSE(package);
+        REQUIRE(package.GetError().code == core::ErrorCode::InvalidArgument);
+    }
+
+    SECTION("missing simulate manifest") {
+        auto options = fixture.PackageOptions();
+        options.builtin_root.clear();
+        options.play_mode = runtime::PlayMode::EditorSimulate;
+        options.simulate_root = ToUtf8(fixture.cooked);
+        options.simulate_manifest = ToUtf8(fixture.directory.Path() / "missing.bytes");
+        auto package = system.CreatePackage(options);
+        REQUIRE_FALSE(package);
+        REQUIRE(package.GetError().code == core::ErrorCode::NotFound);
+    }
+
+    system.Shutdown();
+}
+
+TEST_CASE("runtime explicit play modes reject invalid file system layouts", "[runtime][mode]") {
+    RuntimeFixture fixture;
+    runtime::AssetSystem system;
+    REQUIRE(system.Initialize({}));
+
+    auto missing_builtin = fixture.PackageOptions();
+    missing_builtin.play_mode = runtime::PlayMode::Offline;
+    missing_builtin.builtin_root.clear();
+    auto no_builtin = system.CreatePackage("offline-no-builtin", missing_builtin);
+    REQUIRE_FALSE(no_builtin);
+    REQUIRE(no_builtin.GetError().code == core::ErrorCode::InvalidArgument);
+
+    auto offline_sandbox = fixture.PackageOptions();
+    offline_sandbox.play_mode = runtime::PlayMode::Offline;
+    offline_sandbox.sandbox_root = ToUtf8(fixture.directory.Path() / "offline-sandbox");
+    auto invalid_offline = system.CreatePackage("offline-sandbox", offline_sandbox);
+    REQUIRE_FALSE(invalid_offline);
+    REQUIRE(invalid_offline.GetError().code == core::ErrorCode::InvalidArgument);
+
+    auto host_without_sandbox = fixture.PackageOptions();
+    host_without_sandbox.play_mode = runtime::PlayMode::Host;
+    auto no_sandbox = system.CreatePackage("host-no-sandbox", host_without_sandbox);
+    REQUIRE_FALSE(no_sandbox);
+    REQUIRE(no_sandbox.GetError().code == core::ErrorCode::InvalidArgument);
+
+    auto host_with_custom = fixture.PackageOptions();
+    host_with_custom.play_mode = runtime::PlayMode::Host;
+    host_with_custom.sandbox_root = ToUtf8(fixture.directory.Path() / "host-sandbox");
+    host_with_custom.custom_root = ToUtf8(fixture.directory.Path() / "host-custom");
+    auto invalid_host = system.CreatePackage("host-custom", host_with_custom);
+    REQUIRE_FALSE(invalid_host);
+    REQUIRE(invalid_host.GetError().code == core::ErrorCode::InvalidArgument);
+
     system.Shutdown();
 }
 
@@ -727,6 +1037,7 @@ TEST_CASE("runtime decodes all objects and sub-assets", "[runtime]") {
 
     const AssetGuid material_guid = GuidFrom("multi-material");
     const AssetGuid bundle_guid = GuidFrom("multi-bundle");
+    WriteFile(package_root / (material_guid.ToHex() + ".prca"), asset_bytes.Value());
     serialize::BundleToc toc;
     toc.bundle_guid = bundle_guid;
     toc.bundle_name = "multi";
@@ -789,6 +1100,33 @@ TEST_CASE("runtime decodes all objects and sub-assets", "[runtime]") {
     all.Release();
     subs.Release();
     filtered.Release();
+
+    runtime::ResourcePackageOptions simulate_options;
+    simulate_options.package_name = "simulate-multi";
+    simulate_options.play_mode = runtime::PlayMode::EditorSimulate;
+    simulate_options.simulate_root = ToUtf8(package_root);
+    simulate_options.simulate_manifest = ToUtf8(package_root / "manifest.bytes");
+    auto simulate_package = system.CreatePackage(simulate_options);
+    REQUIRE(simulate_package);
+    auto simulate_all = simulate_package.Value()->LoadAllAssets("multi/asset.prca");
+    INFO(simulate_all.LastError().ToString());
+    REQUIRE(simulate_all.Status() == core::OperationStatus::Succeeded);
+    REQUIRE(simulate_all.Objects().size() == 2);
+    REQUIRE(simulate_all.Get<assets::MaterialAsset>() != nullptr);
+    auto simulate_subs =
+        simulate_package.Value()->LoadSubAssetsSync<assets::TextureAsset>("multi/asset.prca");
+    REQUIRE(simulate_subs.Status() == core::OperationStatus::Succeeded);
+    REQUIRE(simulate_subs.Objects().size() == 1);
+    REQUIRE(simulate_subs.Get<assets::TextureAsset>() != nullptr);
+    auto simulate_filtered =
+        simulate_package.Value()->LoadAllAssets<assets::TextureAsset>("multi/asset.prca");
+    REQUIRE(simulate_filtered.Status() == core::OperationStatus::Succeeded);
+    REQUIRE(simulate_filtered.Objects().size() == 1);
+    simulate_all.Release();
+    simulate_subs.Release();
+    simulate_filtered.Release();
+    REQUIRE(system.DestroyPackage("simulate-multi"));
+
     REQUIRE(system.DestroyPackage("multi"));
     system.Shutdown();
 }
@@ -1090,15 +1428,84 @@ TEST_CASE("runtime unload stays within the frame budget", "[runtime][performance
     system.Shutdown();
 }
 
+TEST_CASE("runtime unpacks builtin bundles and imports external bundles", "[runtime][transfer]") {
+    RuntimeFixture fixture;
+    TempDir sandbox_directory{"runtime_transfer"};
+    const std::filesystem::path cache = sandbox_directory.Path() / "cache";
+    std::filesystem::create_directories(cache);
 
+    runtime::AssetSystem system;
+    REQUIRE(system.Initialize({}));
+    runtime::ResourcePackageOptions options;
+    options.package_name = "game";
+    options.builtin_root = fixture.output_directory;
+    options.sandbox_root = ToUtf8(cache);
+    auto package = system.CreatePackage(options);
+    REQUIRE(package);
+    const auto manifest = package.Value()->Manifest();
+    REQUIRE(manifest != nullptr);
+    REQUIRE_FALSE(manifest->Bundles().empty());
 
+    auto unpacker = package.Value()->CreateUnpacker();
+    REQUIRE(unpacker);
+    INFO(unpacker.Value()->LastError().ToString());
+    unpacker.Value()->Start();
+    for (int i = 0; i < 2000 && !unpacker.Value()->IsDone(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(unpacker.Value()->IsDone());
+    REQUIRE(unpacker.Value()->Status() == core::OperationStatus::Succeeded);
+    REQUIRE(unpacker.Value()->Progress() == Catch::Approx(1.0f));
+    for (const auto& bundle : manifest->Bundles()) {
+        REQUIRE(std::filesystem::exists(cache / "bundles" / std::string(bundle.file_name)));
+    }
 
+    auto empty_importer = package.Value()->CreateImporter();
+    REQUIRE_FALSE(empty_importer);
+    REQUIRE(empty_importer.GetError().code == core::ErrorCode::InvalidArgument);
 
+    const auto* bundle = manifest->FindBundleByName("a");
+    REQUIRE(bundle != nullptr);
+    const std::string bundle_file(bundle->file_name);
+    const std::filesystem::path cached_bundle = cache / "bundles" / bundle_file;
+    REQUIRE(std::filesystem::exists(cached_bundle));
+    REQUIRE(std::filesystem::remove(cached_bundle));
+    (void)std::filesystem::remove(cached_bundle.string() + ".cache");
 
+    const std::filesystem::path source_bundle =
+        std::filesystem::path(fixture.output_directory) / "bundles" / bundle_file;
+    REQUIRE(std::filesystem::exists(source_bundle));
+    runtime::BundleImportOptions missing_options;
+    missing_options.bundles.push_back(runtime::BundleImportInfo{
+        ToUtf8(cache / "missing.bundle"), std::string(bundle->bundle_name), bundle->bundle_guid});
+    auto missing_import = package.Value()->CreateImporter(missing_options);
+    REQUIRE(missing_import);
+    missing_import.Value()->Start();
+    for (int i = 0; i < 2000 && !missing_import.Value()->IsDone(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(missing_import.Value()->IsDone());
+    REQUIRE(missing_import.Value()->Status() == core::OperationStatus::Failed);
+    REQUIRE_FALSE(missing_import.Value()->LastError().IsOk());
 
+    runtime::BundleImportOptions import_options;
+    import_options.max_concurrency = 2;
+    import_options.bundles.push_back(runtime::BundleImportInfo{
+        ToUtf8(source_bundle), std::string(bundle->bundle_name), bundle->bundle_guid});
 
+    auto importer = package.Value()->CreateImporter(import_options);
+    REQUIRE(importer);
+    INFO(importer.Value()->LastError().ToString());
+    importer.Value()->Start();
+    for (int i = 0; i < 2000 && !importer.Value()->IsDone(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(importer.Value()->IsDone());
+    REQUIRE(importer.Value()->Status() == core::OperationStatus::Succeeded);
+    REQUIRE(importer.Value()->Progress() == Catch::Approx(1.0f));
+    REQUIRE(std::filesystem::exists(cached_bundle));
+    REQUIRE(ReadFile(cached_bundle) == ReadFile(source_bundle));
 
-
-
-
-
+    REQUIRE(system.DestroyPackage("game"));
+    system.Shutdown();
+}

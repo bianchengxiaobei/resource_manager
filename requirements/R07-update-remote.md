@@ -33,7 +33,11 @@ Windows WinHTTP 后端与进程内 MockTransport 测试。
 
 明确延期：
 
-- 真实 CDN/TLS/吞吐（loopback + 连接句柄复用已通过 `scripts/run-winhttp-smoke.ps1`；自动测试默认使用 MockTransport）。
+- 真实 CDN 边缘的签名 URL/鉴权流程（TLS/连接复用/吞吐和完整 Bundle 安装已通过
+  `scripts/run-cdn-smoke.ps1`/`scripts/run-cdn-bundle-smoke.ps1`；真实 Parcel
+  服务端的签名 URL 链路已由 `scripts/run-signed-url-smoke.ps1` 在 loopback HTTP
+  上验证，包含签名下载、未签名/篡改/过期 403 和无 Token 401；CDN 边缘仍需宿主
+  CDN 配置）。
 - 系统级磁盘满未注入；写前 FreeSpace 与 commit 失败注入已覆盖。
 
 边界：生产签名密钥只在服务端；客户端通过 `/api/v1/client/url` 消费签名 URL。
@@ -78,11 +82,16 @@ Windows WinHTTP 后端与进程内 MockTransport 测试。
 - [x] 签名 URL 消费/过期重签（`SignedUrlProvider`；服务端签名 URL + 403/410 重新签名）。
 - [x] 灰度：百分比/白名单/平台/App 版本。
 - [x] 回滚/离线缓存。
-- [ ] OpenAPI/JSON schema 对齐（R08）。
+- [x] OpenAPI/JSON schema 对齐（R08）：`server/internal/api/openapi_test.go` 双向校验
+  method/path，并核对主要 schema 顶层 JSON 字段；`openapi-typescript` 生成文件无
+  diff，`vue-tsc`/Vite 构建通过。
 
 ### Mock Server/测试
 
 - [x] 本地 HTTP loopback server smoke（`scripts/run-winhttp-smoke.ps1`；Python 静态服务 + WinHTTP 真实下载）。
+- [x] 真实 CDN/TLS/吞吐 smoke（`scripts/run-cdn-smoke.ps1`；Cloudflare 8 MiB，证书链、连接复用和冷/热吞吐）。
+- [x] 真实 CDN 完整 Bundle 安装 smoke（`scripts/run-cdn-bundle-smoke.ps1`；GitHub raw 328 B fixture，下载/校验/缓存安装）。
+- [x] 真实服务端签名 URL 链路（`scripts/run-signed-url-smoke.ps1`：启动 `parcel-server`、创建包/版本/发布、签发设备 Token，再用 WinHTTP + `SignedUrlProvider` 下载；签名下载、未签名/篡改/过期 403、无 Token 401，32 assertions）。
 - [x] MockTransport 覆盖 200/401/403/404/500、慢响应、传输失败。
 - [x] Range/不支持 Range。
 - [x] Token/签名 URL/灰度变体。
@@ -90,7 +99,9 @@ Windows WinHTTP 后端与进程内 MockTransport 测试。
 
 ## 验收标准
 
-- 首次安装、增量更新、回滚、断点续传、损坏修复全流程通过（MockTransport；loopback WinHTTP 真实下载 smoke 通过）。
+- 首次安装、增量更新、回滚、断点续传、损坏修复全流程通过（MockTransport；loopback
+  WinHTTP 真实下载、真实 CDN/TLS 传输/完整 Bundle 安装和真实服务端签名 URL smoke
+  通过；CDN 边缘签名配置待宿主）。
 - 多 CDN 失败可切换；401 刷新一次；签名 URL 过期/403 可重新签名。
 - 灰度百分比/白名单/平台/App 版本正确；回滚生效。
 - 下载失败/进度/取消/暂停行为可预测。

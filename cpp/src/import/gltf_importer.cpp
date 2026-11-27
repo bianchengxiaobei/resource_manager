@@ -5,6 +5,7 @@
 #include "parcel/import/sidecar_merge.hpp"
 #include "parcel/import/texture_dedup.hpp"
 #include "texture_decode.hpp"
+#include "texture_transform.hpp"
 
 #include "parcel/assets/animation_clip_asset.hpp"
 #include "parcel/assets/material_asset.hpp"
@@ -24,6 +25,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <memory>
@@ -384,14 +386,14 @@ core::Result<std::string> ProjectRelative(std::string_view root, std::string_vie
     const std::filesystem::path relative =
         std::filesystem::relative(Utf8Path(path), Utf8Path(root), error);
     if (error) {
-        return MakeError(ErrorCode::Io, "failed to resolve texture path: " + error.message())
+        return MakeError(ErrorCode::Io, "failed to resolve project path: " + error.message())
             .WithPath(std::string(path));
     }
     const std::u8string text = relative.u8string();
     std::string result =
         core::path::Normalize(std::string(reinterpret_cast<const char*>(text.data()), text.size()));
     if (result.rfind("../", 0) == 0 || result == "..") {
-        return MakeError(ErrorCode::InvalidArgument, "texture path is outside the project");
+        return MakeError(ErrorCode::InvalidArgument, "path is outside the project");
     }
     return result;
 }
@@ -409,6 +411,43 @@ std::string DirectoryOf(std::string_view path) {
         return normalized.substr(0, 2);
     }
     return normalized.substr(0, slash);
+}
+
+struct ResolvedExternalPath {
+    std::string absolute;
+    std::string relative;
+};
+
+core::Result<ResolvedExternalPath> ResolveGlTFExternalPath(std::string_view project_root,
+                                                           std::string_view source_directory,
+                                                           std::string_view uri,
+                                                           std::string_view kind) {
+    const std::string decoded = PercentDecode(uri);
+    const std::string normalized = core::path::Normalize(decoded);
+    if (normalized.empty()) {
+        return MakeError(ErrorCode::InvalidArgument,
+                         "glTF " + std::string(kind) + " path is empty");
+    }
+
+    std::string absolute;
+    if (core::path::IsAbsolute(normalized)) {
+        absolute = normalized;
+    } else {
+        absolute = std::string(source_directory);
+        if (!absolute.empty() && absolute.back() != '/') {
+            absolute.push_back('/');
+        }
+        absolute += normalized;
+        absolute = core::path::Normalize(absolute);
+    }
+
+    auto relative = ProjectRelative(project_root, absolute);
+    if (!relative) {
+        return MakeError(ErrorCode::InvalidArgument,
+                         "glTF " + std::string(kind) + " path is outside the project: " + absolute)
+            .WithPath(std::string(uri));
+    }
+    return ResolvedExternalPath{std::move(absolute), std::move(relative).Value()};
 }
 
 std::string FindSidecarPath(std::string_view source_path) {
@@ -620,20 +659,12 @@ core::Result<void> ValidateExternalBuffers(const cgltf_data& data, const ImportR
         if (buffer.uri == nullptr || std::string_view(buffer.uri).starts_with("data:")) {
             continue;
         }
-        const std::string decoded = PercentDecode(buffer.uri);
-        const std::string normalized = core::path::Normalize(decoded);
-        auto candidate = core::path::IsAbsolute(normalized)
-                             ? core::Result<std::string>{normalized}
-                             : core::path::Join(source_directory, normalized);
-        if (!candidate) {
-            return MakeError(ErrorCode::InvalidArgument, "glTF buffer path is invalid: " + decoded)
-                .WithPath(request.source_path);
-        }
-        auto relative = ProjectRelative(request.project_root, candidate.Value());
-        if (!relative) {
-            return MakeError(ErrorCode::InvalidArgument,
-                             "glTF buffer path is outside the project: " + candidate.Value())
-                .WithPath(request.source_path);
+        auto resolved =
+            ResolveGlTFExternalPath(request.project_root, source_directory, buffer.uri, "buffer");
+        if (!resolved) {
+            auto error = std::move(resolved).TakeError();
+            error.WithPath(request.source_path);
+            return error;
         }
     }
     return {};
@@ -746,6 +777,7 @@ struct TextureResolver {
     std::vector<std::string>& warnings;
     std::vector<AssetGuid>& dependencies;
     std::unordered_map<const cgltf_image*, AssetGuid> cache;
+    std::unordered_map<std::string, AssetGuid> baked_cache;
     std::unordered_map<std::string, AssetGuid>& by_content;
     std::vector<CookedAsset>& assets;
     const cgltf_data* data = nullptr;
@@ -813,39 +845,31 @@ struct TextureResolver {
             return {};
         }
 
-        const std::string decoded = PercentDecode(image->uri);
         const std::string source_directory = DirectoryOf(request.source_path);
-        const std::string normalized = core::path::Normalize(decoded);
-        auto candidate = core::path::IsAbsolute(normalized)
-                             ? core::Result<std::string>{normalized}
-                             : core::path::Join(source_directory, normalized);
-        if (!candidate) {
-            warnings.push_back("glTF image path is invalid: " + decoded);
+        auto resolved =
+            ResolveGlTFExternalPath(request.project_root, source_directory, image->uri, "image");
+        if (!resolved) {
+            warnings.push_back(resolved.GetError().message);
             cache.emplace(image, AssetGuid{});
             return {};
         }
+        const ResolvedExternalPath& path = resolved.Value();
         std::error_code error;
-        if (!std::filesystem::is_regular_file(Utf8Path(candidate.Value()), error)) {
-            warnings.push_back("missing glTF image: " + candidate.Value());
-            cache.emplace(image, AssetGuid{});
-            return {};
-        }
-        auto relative = ProjectRelative(request.project_root, candidate.Value());
-        if (!relative) {
-            warnings.push_back("glTF image is outside the project: " + candidate.Value());
+        if (!std::filesystem::is_regular_file(Utf8Path(path.absolute), error)) {
+            warnings.push_back("missing glTF image: " + path.absolute);
             cache.emplace(image, AssetGuid{});
             return {};
         }
 
         AssetGuid guid;
         if (const TextureCanonicalAsset* canonical =
-                FindCanonicalTextureByPath(request.texture_index, relative.Value());
+                FindCanonicalTextureByPath(request.texture_index, path.relative);
             canonical != nullptr) {
             guid = canonical->asset_guid;
         } else {
-            guid = DefaultTextureAssetGuid(relative.Value());
+            guid = DefaultTextureAssetGuid(path.relative);
         }
-        if (const auto hash = core::Sha256File(candidate.Value()); hash) {
+        if (const auto hash = core::Sha256File(path.absolute); hash) {
             by_content.emplace(hash.Value().ToHex(), guid);
         }
         if (!guid.IsZero() &&
@@ -853,6 +877,147 @@ struct TextureResolver {
             dependencies.push_back(guid);
         }
         cache.emplace(image, guid);
+        return guid;
+    }
+
+    [[nodiscard]] std::size_t ImageIndex(const cgltf_image* image) const noexcept {
+        if (data != nullptr && data->images != nullptr && image >= data->images &&
+            image < data->images + data->images_count) {
+            return static_cast<std::size_t>(image - data->images);
+        }
+        return 0;
+    }
+
+    [[nodiscard]] bool ReadImageBytes(const cgltf_image* image, std::vector<std::byte>& bytes,
+                                      std::string& error) const {
+        if (image == nullptr) {
+            error = "image is missing";
+            return false;
+        }
+        if (image->buffer_view != nullptr ||
+            (image->uri != nullptr && std::string_view(image->uri).starts_with("data:"))) {
+            return ReadEmbeddedImage(image, bytes, error);
+        }
+        if (image->uri == nullptr) {
+            error = "image has no URI or buffer view";
+            return false;
+        }
+
+        auto resolved = ResolveGlTFExternalPath(
+            request.project_root, DirectoryOf(request.source_path), image->uri, "image");
+        if (!resolved) {
+            error = resolved.GetError().message;
+            return false;
+        }
+        std::error_code file_error;
+        if (!std::filesystem::is_regular_file(Utf8Path(resolved.Value().absolute), file_error)) {
+            error = "missing image: " + resolved.Value().absolute;
+            return false;
+        }
+        std::ifstream file(Utf8Path(resolved.Value().absolute), std::ios::binary | std::ios::ate);
+        if (!file) {
+            error = "failed to open image: " + resolved.Value().absolute;
+            return false;
+        }
+        const std::streamoff length = file.tellg();
+        if (length < 0 || static_cast<std::uint64_t>(length) > kMaxEmbeddedImageBytes) {
+            error = "image has an invalid size";
+            return false;
+        }
+        bytes.resize(static_cast<std::size_t>(length));
+        file.seekg(0);
+        if (!bytes.empty()) {
+            file.read(reinterpret_cast<char*>(bytes.data()),
+                      static_cast<std::streamsize>(bytes.size()));
+        }
+        if (!file) {
+            error = "failed to read image: " + resolved.Value().absolute;
+            return false;
+        }
+        return true;
+    }
+
+    static std::string FloatKey(float value) {
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return std::to_string(bits);
+    }
+
+    static std::string BakeKey(const TextureUvTransform& transform,
+                               const assets::TextureSampler& sampler, bool srgb) {
+        return FloatKey(transform.offset.x) + ":" + FloatKey(transform.offset.y) + ":" +
+               FloatKey(transform.rotation) + ":" + FloatKey(transform.scale.x) + ":" +
+               FloatKey(transform.scale.y) + ":" +
+               std::to_string(static_cast<int>(sampler.wrap_s)) + ":" +
+               std::to_string(static_cast<int>(sampler.wrap_t)) + ":" +
+               std::to_string(sampler.mag_filter == assets::TextureFilter::Linear ? 1 : 0) + ":" +
+               (srgb ? "1" : "0");
+    }
+
+    static void SetSrgb(assets::JsonValue& settings, bool srgb) {
+        for (auto& [key, value] : settings.object_value) {
+            if (key == "sRGB") {
+                value.bool_value = srgb;
+                return;
+            }
+        }
+    }
+
+    [[nodiscard]] std::string Target() const {
+        return request.settings != nullptr ? SettingString(*request.settings, "target", "") : "";
+    }
+
+    AssetGuid ResolveBaked(const cgltf_image* image, const TextureUvTransform& transform,
+                           const assets::TextureSampler& sampler, bool srgb) {
+        if (image == nullptr) {
+            return {};
+        }
+        const std::size_t image_index = ImageIndex(image);
+        const std::string key =
+            std::to_string(image_index) + ":" + BakeKey(transform, sampler, srgb);
+        if (const auto cached = baked_cache.find(key); cached != baked_cache.end()) {
+            return cached->second;
+        }
+
+        std::vector<std::byte> bytes;
+        std::string read_error;
+        if (!ReadImageBytes(image, bytes, read_error)) {
+            warnings.push_back("failed to bake glTF image '" + NameOr(image->name, "image") +
+                               "': " + read_error);
+            baked_cache.emplace(key, AssetGuid{});
+            return {};
+        }
+
+        assets::JsonValue texture_settings = MakeDefaultImportSettings("texture", Target());
+        SetSrgb(texture_settings, srgb);
+        TextureBakeOptions bake;
+        bake.transform = transform;
+        bake.wrap_s = sampler.wrap_s;
+        bake.wrap_t = sampler.wrap_t;
+        bake.bilinear = sampler.mag_filter == assets::TextureFilter::Linear;
+        auto decoded = DecodeTextureAsset(
+            bytes, texture_settings,
+            request.source_path + ":image:" + std::to_string(image_index) + ":bake", &bake);
+        if (!decoded) {
+            warnings.push_back("failed to bake glTF image '" + NameOr(image->name, "image") +
+                               "': " + decoded.GetError().ToString());
+            baked_cache.emplace(key, AssetGuid{});
+            return {};
+        }
+
+        const std::string local_id = "gltf-image:" + std::to_string(image_index) + ":bake:" + key;
+        const AssetGuid guid = MakeSubAssetGuid(request.source_guid, "texture", local_id);
+        CookedAsset cooked;
+        cooked.guid = guid;
+        cooked.local_id = "texture:" + local_id;
+        cooked.role = "texture";
+        cooked.object = std::move(decoded).Value();
+        assets.push_back(std::move(cooked));
+
+        if (std::find(dependencies.begin(), dependencies.end(), guid) == dependencies.end()) {
+            dependencies.push_back(guid);
+        }
+        baked_cache.emplace(key, guid);
         return guid;
     }
 };
@@ -907,15 +1072,104 @@ assets::TextureSampler ToTextureSampler(const cgltf_sampler* source) {
     return sampler;
 }
 
+struct MaterialUvTransformPlan {
+    bool apply = false;
+    bool bake_textures = false;
+    bool requires_uv0 = false;
+    TextureUvTransform transform;
+    std::string unsupported_reason;
+};
+
+TextureUvTransform ViewTextureTransform(const cgltf_texture_view& view) {
+    TextureUvTransform transform;
+    if (view.has_transform) {
+        transform.offset = {view.transform.offset[0], view.transform.offset[1]};
+        transform.rotation = view.transform.rotation;
+        transform.scale = {view.transform.scale[0], view.transform.scale[1]};
+    }
+    return transform;
+}
+
+MaterialUvTransformPlan PlanMaterialUvTransform(const cgltf_material* material) {
+    MaterialUvTransformPlan result;
+    if (material == nullptr) {
+        return result;
+    }
+
+    const std::array<const cgltf_texture_view*, 5> views = {
+        &material->pbr_metallic_roughness.base_color_texture,
+        &material->pbr_metallic_roughness.metallic_roughness_texture,
+        &material->normal_texture,
+        &material->occlusion_texture,
+        &material->emissive_texture,
+    };
+
+    bool has_any_transform = false;
+    bool has_nonzero_uv_set = false;
+    bool has_texture = false;
+    bool transforms_mismatch = false;
+    TextureUvTransform first;
+    for (const cgltf_texture_view* view : views) {
+        if (view->texture == nullptr) {
+            continue;
+        }
+        has_any_transform |= view->has_transform != 0;
+        const int uv_set = view->has_transform && view->transform.has_texcoord
+                               ? view->transform.texcoord
+                               : view->texcoord;
+        has_nonzero_uv_set |= uv_set != 0;
+        const TextureUvTransform transform = ViewTextureTransform(*view);
+        if (!has_texture) {
+            first = transform;
+            has_texture = true;
+        } else if (!TransformsMatch(first, transform)) {
+            transforms_mismatch = true;
+        }
+    }
+    if (!has_any_transform) {
+        return result;
+    }
+    result.requires_uv0 = true;
+    if (has_nonzero_uv_set) {
+        result.unsupported_reason =
+            "KHR_texture_transform requires TEXCOORD_0 for every material texture";
+        return result;
+    }
+    if (!has_texture) {
+        return result;
+    }
+    if (transforms_mismatch) {
+        result.bake_textures = true;
+        return result;
+    }
+    if (first.IsIdentity()) {
+        return result;
+    }
+    result.apply = true;
+    result.transform = first;
+    return result;
+}
+
 AssetGuid ResolveTextureView(TextureResolver& resolver, const cgltf_texture_view& view,
-                             assets::TextureRef& reference) {
+                             assets::TextureRef& reference, bool bake_texture, bool srgb) {
     reference = {};
     if (view.texture == nullptr) {
         return {};
     }
-    reference.texture = resolver.Resolve(view.texture->image);
-    reference.uv_set = std::max(0, view.texcoord);
     reference.sampler = ToTextureSampler(view.texture->sampler);
+    const TextureUvTransform transform = ViewTextureTransform(view);
+    if (bake_texture && !transform.IsIdentity()) {
+        reference.texture =
+            resolver.ResolveBaked(view.texture->image, transform, reference.sampler, srgb);
+        if (!reference.texture.IsZero()) {
+            reference.uv_set = 0;
+            return reference.texture;
+        }
+    }
+    reference.texture = resolver.Resolve(view.texture->image);
+    reference.uv_set = view.has_transform && view.transform.has_texcoord
+                           ? std::max(0, view.transform.texcoord)
+                           : std::max(0, view.texcoord);
     return reference.texture;
 }
 
@@ -927,6 +1181,9 @@ struct PrimitiveInfo {
     std::size_t index_count = 0;
     std::uint32_t material_index = 0;
     std::uint32_t target_count = 0;
+    bool transform_uv = false;
+    bool requires_uv0 = false;
+    TextureUvTransform uv_transform;
 };
 
 struct MeshInfo {
@@ -1047,12 +1304,12 @@ struct MeshBuildResult {
     std::vector<AssetGuid> materials;
 };
 
-MeshBuildResult
-BuildMesh(const cgltf_mesh& source, std::size_t mesh_index,
-          const std::vector<AssetGuid>& material_guids,
-          const std::unordered_map<const cgltf_material*, std::uint32_t>& material_indices,
-          std::uint32_t default_material, std::optional<cgltf_size> material_variant, float scale,
-          std::vector<std::string>& warnings) {
+MeshBuildResult BuildMesh(
+    const cgltf_mesh& source, std::size_t mesh_index, const std::vector<AssetGuid>& material_guids,
+    const std::unordered_map<const cgltf_material*, std::uint32_t>& material_indices,
+    const std::unordered_map<const cgltf_material*, MaterialUvTransformPlan>& material_uv_plans,
+    std::uint32_t default_material, std::optional<cgltf_size> material_variant, float scale,
+    std::vector<std::string>& warnings) {
     MeshBuildResult result;
     result.mesh = std::make_shared<assets::MeshAsset>();
     assets::MeshAsset& mesh = *result.mesh;
@@ -1114,6 +1371,16 @@ BuildMesh(const cgltf_mesh& source, std::size_t mesh_index,
 
         const cgltf_material* material_source =
             SelectPrimitiveMaterial(primitive, material_variant);
+        if (material_source != nullptr) {
+            if (const auto plan = material_uv_plans.find(material_source);
+                plan != material_uv_plans.end()) {
+                info.requires_uv0 = plan->second.requires_uv0;
+                if (plan->second.apply) {
+                    info.transform_uv = true;
+                    info.uv_transform = plan->second.transform;
+                }
+            }
+        }
         std::uint32_t global_material = default_material;
         if (material_source != nullptr) {
             const auto found = material_indices.find(material_source);
@@ -1202,6 +1469,10 @@ BuildMesh(const cgltf_mesh& source, std::size_t mesh_index,
             UnpackFloats(uv0, 2, uv0_data, uv0_count) && uv0_count == info.vertex_count;
         const bool has_uv1 =
             UnpackFloats(uv1, 2, uv1_data, uv1_count) && uv1_count == info.vertex_count;
+        if (info.requires_uv0 && !has_uv0) {
+            warnings.push_back("glTF KHR_texture_transform requires TEXCOORD_0 on primitive: " +
+                               mesh.name);
+        }
         bool has_colors = false;
         std::size_t color_components = 4;
         if (colors != nullptr) {
@@ -1238,7 +1509,8 @@ BuildMesh(const cgltf_mesh& source, std::size_t mesh_index,
                                   tangent_data[vertex * 4 + 2], tangent_data[vertex * 4 + 3]};
             }
             if (has_uv0) {
-                output.texcoord0 = {uv0_data[vertex * 2], uv0_data[vertex * 2 + 1]};
+                const Vec2 uv{uv0_data[vertex * 2], uv0_data[vertex * 2 + 1]};
+                output.texcoord0 = info.transform_uv ? info.uv_transform.Apply(uv) : uv;
             }
             if (has_uv1) {
                 output.texcoord1 = {uv1_data[vertex * 2], uv1_data[vertex * 2 + 1]};
@@ -1636,7 +1908,7 @@ void SetComponent(SceneData& scene, scene::EntityId owner, const T& component) {
 class GltfImporter final : public IAssetImporter {
   public:
     std::string_view Name() const noexcept override { return "gltf"; }
-    std::uint32_t Version() const noexcept override { return 6; }
+    std::uint32_t Version() const noexcept override { return 9; }
 
     bool Supports(std::string_view extension) const noexcept override {
         return extension == ".gltf" || extension == ".glb";
@@ -1741,8 +2013,8 @@ class GltfImporter final : public IAssetImporter {
         material_guids.reserve(data->materials_count + 1);
         std::unordered_map<const cgltf_material*, std::uint32_t> material_indices;
         std::unordered_map<std::string, AssetGuid> materials_by_content;
-        TextureResolver texture_resolver{request,          result.warnings, dependencies, {},
-                                         textures_by_hash, result.assets,   data.get()};
+        TextureResolver texture_resolver{request, result.warnings,  dependencies,  {},
+                                         {},      textures_by_hash, result.assets, data.get()};
 
         auto add_material = [&](const cgltf_material* source, std::size_t index) -> AssetGuid {
             TextureResolver& resolver = texture_resolver;
@@ -1813,14 +2085,18 @@ class GltfImporter final : public IAssetImporter {
                         source->diffuse_transmission.diffuse_transmission_factor;
                     material.thickness = 1.0f;
                 }
+                const MaterialUvTransformPlan plan = PlanMaterialUvTransform(source);
                 ResolveTextureView(resolver, source->pbr_metallic_roughness.base_color_texture,
-                                   material.base_color_texture);
+                                   material.base_color_texture, plan.bake_textures, true);
                 ResolveTextureView(resolver,
                                    source->pbr_metallic_roughness.metallic_roughness_texture,
-                                   material.metallic_roughness_texture);
-                ResolveTextureView(resolver, source->normal_texture, material.normal_texture);
-                ResolveTextureView(resolver, source->occlusion_texture, material.occlusion_texture);
-                ResolveTextureView(resolver, source->emissive_texture, material.emissive_texture);
+                                   material.metallic_roughness_texture, plan.bake_textures, false);
+                ResolveTextureView(resolver, source->normal_texture, material.normal_texture,
+                                   plan.bake_textures, false);
+                ResolveTextureView(resolver, source->occlusion_texture, material.occlusion_texture,
+                                   plan.bake_textures, false);
+                ResolveTextureView(resolver, source->emissive_texture, material.emissive_texture,
+                                   plan.bake_textures, true);
             } else {
                 material.name = "Default";
             }
@@ -1888,6 +2164,19 @@ class GltfImporter final : public IAssetImporter {
             }
         }
 
+        std::unordered_map<const cgltf_material*, MaterialUvTransformPlan> material_uv_plans;
+        for (cgltf_size index = 0; index < data->materials_count; ++index) {
+            const MaterialUvTransformPlan plan = PlanMaterialUvTransform(&data->materials[index]);
+            if (!plan.unsupported_reason.empty()) {
+                result.warnings.push_back(
+                    plan.unsupported_reason + ": " +
+                    NameOr(data->materials[index].name, "Material" + std::to_string(index)));
+            }
+            if (plan.requires_uv0) {
+                material_uv_plans.emplace(&data->materials[index], plan);
+            }
+        }
+
         std::vector<MeshInfo> mesh_infos(data->meshes_count);
         std::unordered_map<std::string, AssetGuid> meshes_by_content;
         std::unordered_set<AssetGuid, core::Guid128Hash> emitted_meshes;
@@ -1895,8 +2184,8 @@ class GltfImporter final : public IAssetImporter {
             const cgltf_mesh& source = data->meshes[index];
             MeshBuildResult built =
                 BuildMesh(source, static_cast<std::size_t>(index), material_guids, material_indices,
-                          static_cast<std::uint32_t>(default_material_index), material_variant,
-                          scale, result.warnings);
+                          material_uv_plans, static_cast<std::uint32_t>(default_material_index),
+                          material_variant, scale, result.warnings);
             if (!built.mesh || built.mesh->vertices.empty()) {
                 result.warnings.push_back("glTF mesh is empty: " + std::to_string(index));
                 continue;

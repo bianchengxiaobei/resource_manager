@@ -106,8 +106,37 @@ export function createPackage(name: string): Promise<Package> {
   });
 }
 
+export function renamePackage(packageName: string, name: string): Promise<Package> {
+  return request(`/api/v1/admin/packages/${encodeURIComponent(packageName)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ name }),
+  });
+}
+
+export function deletePackage(packageName: string): Promise<void> {
+  return request(
+    `/api/v1/admin/packages/${encodeURIComponent(packageName)}?confirm=${encodeURIComponent(packageName)}`,
+    { method: "DELETE" },
+  );
+}
+
 export function listVersions(packageName: string): Promise<{ items: Version[] }> {
   return request(`/api/v1/admin/packages/${encodeURIComponent(packageName)}/versions`);
+}
+
+export function renameVersion(packageName: string, version: string, newVersion: string): Promise<Version> {
+  return request(
+    `/api/v1/admin/packages/${encodeURIComponent(packageName)}/versions/${encodeURIComponent(version)}`,
+    { method: "PATCH", body: JSON.stringify({ version: newVersion }) },
+  );
+}
+
+export function deleteVersion(packageName: string, version: string): Promise<void> {
+  return request(
+    `/api/v1/admin/packages/${encodeURIComponent(packageName)}/versions/${encodeURIComponent(version)}` +
+      `?confirm=${encodeURIComponent(version)}`,
+    { method: "DELETE" },
+  );
 }
 
 export function listChannels(packageName: string): Promise<{ items: Channel[] }> {

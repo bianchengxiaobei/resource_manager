@@ -53,6 +53,7 @@ R02。
 - [x] glTF texture sampler（wrapS/T、min/mag/mip filter）写入 TextureRef。
 - [x] `EXT_meshopt_compression`：ATTRIBUTES/TRIANGLES/INDICES 与 NONE/Octahedral/Quaternion/Exponential filter 解码。
 - [x] `KHR_materials_variants`：按 `materialVariant` 设置选择变体材质，未覆盖 primitive 回退默认材质。
+- [x] `KHR_texture_transform`：仅 UV0。所有已映射纹理共享同一 transform 时把 offset/rotation/scale 烘入 TEXCOORD_0；逐贴图 transform 不同时按源图+transform+sampler+sRGB 生成烘焙 TextureAsset，网格 UV0 保持不变；texCoord!=0 追加 warning。
 - [x] glTF scene 选择：`scene` 支持名称/0-based 索引，空值使用默认 scene，未声明默认 scene 时回退全部 node；仅选中 scene 可达节点创建渲染组件。
 - [x] skin、morph targets、TRS/Weights 动画导入。
 - [x] sidecar settings/camera/light override 与额外场景组件。
@@ -121,7 +122,8 @@ R02。
 - 可选 shader build：`--shader-build-*` 调用 hdrp-bgfx `shader_build.py`，失败中止；成功后强制重导 Shader manifest
 - `parcel_import` CLI、并行导入、`import_report.json`
 - 真实 YooAsset FBX smoke：Material/Mesh/Scene + 1 个共享 Texture PRCA（3 个同内容纹理源复用），二次导入 skip
-- glTF/GLB smoke：triangle 场景导入 mesh/material/scene/skin/morph/animation；sidecar 覆盖；GLB 二进制 buffer；embedded bufferView/data URI 图片；sampler wrap/filter 映射；KHR_materials_variants 选择/回退；EXT_meshopt_compression 解码；默认/命名/索引 scene 选择；完整 Import 流水线纹理复用与二次 skip
+- glTF/GLB smoke：triangle 场景导入 mesh/material/scene/skin/morph/animation；sidecar 覆盖；GLB 二进制 buffer；embedded bufferView/data URI 图片；sampler wrap/filter 映射；KHR_materials_variants 选择/回退；KHR_texture_transform 共享 UV0 烘焙/逐贴图纹理变体烘焙/UV1 告警；EXT_meshopt_compression 解码；默认/命名/索引 scene 选择；完整 Import 流水线纹理复用与二次 skip；新增 KHR 烘焙/告警 3 cases / 84 assertions
+- 真实 Proland 资产 smoke：60067 nodes、67 meshes、4 materials、6 external textures 按原始 `../../assets/...` 布局完成导入/打包；glTF importer v9 支持父目录相对路径（解析后必须位于 project root）、KHR_texture_transform 的共享 UV0 网格烘焙和逐贴图纹理变体烘焙，外部纹理需与 glTF 同批导入。
 
 R03 已完成。
 

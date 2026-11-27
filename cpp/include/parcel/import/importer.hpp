@@ -2,10 +2,12 @@
 
 #include "parcel/assets/asset.hpp"
 #include "parcel/assets/json.hpp"
+#include "parcel/assets/texture_asset.hpp"
 #include "parcel/core/guid.hpp"
 #include "parcel/core/result.hpp"
 #include "parcel/import/texture_dedup.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -14,6 +16,10 @@
 
 namespace parcel::import {
 
+using TextureDecodeFallback = std::shared_ptr<assets::TextureAsset> (*)(const std::byte* data,
+                                                                        std::size_t size,
+                                                                        void* user);
+
 struct ImportRequest {
     std::string project_root;
     std::string source_path;
@@ -21,6 +27,8 @@ struct ImportRequest {
     core::AssetGuid source_guid;
     const assets::JsonValue* settings = nullptr;
     const TextureCanonicalIndex* texture_index = nullptr;
+    TextureDecodeFallback texture_decode_fallback = nullptr;
+    void* texture_decode_user = nullptr;
 };
 
 struct CookedAsset {

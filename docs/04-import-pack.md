@@ -1,4 +1,4 @@
-﻿# 04 导入与打包
+# 04 导入与打包
 
 ## 1. Import 目标
 
@@ -70,7 +70,7 @@ struct ImportResult {
 首批 Importer：
 
 - `fbx`：assimp 读取 mesh/material/texture/node/camera/light/animation/bone/blend shape；生成 MeshAsset/MaterialAsset/AnimationClipAsset/SceneAsset 和 SkinComponent。
-- `gltf`：内置 cgltf 读取 `.gltf`/`.glb`，支持 mesh/material/texture/node/camera/KHR_lights_punctual、KHR_materials_variants、EXT_meshopt_compression、scene 选择、skin、morph targets 与 TRS/Weights 动画。
+- `gltf`：内置 cgltf 读取 `.gltf`/`.glb`，支持 mesh/material/texture/node/camera/KHR_lights_punctual、KHR_materials_variants、KHR_texture_transform（UV0；共享 transform 烘网格，逐贴图 transform 烘纹理变体）、EXT_meshopt_compression、scene 选择、skin、morph targets 与 TRS/Weights 动画。
 - `texture`：PNG/TGA/JPG/HDR → TextureAsset；BC1/BC3/BC5/BC7、RGBA16F/32F、mip。
 - `shader`：hdrp-bgfx manifest + bin → ShaderLibraryAsset。
 - `scene settings`：hdrp-bgfx JSON → Parcel Settings 资产。
@@ -124,16 +124,25 @@ struct ImportResult {
   合并逻辑与 FBX 一致。
 - 纹理：external image 沿用 canonical texture GUID；embedded image（bufferView/data URI）
   解码为 TextureAsset 子资产，GUID 由 glTF 源 + image index 派生，Material 引用并写入
-  ImportDB 依赖。
+  ImportDB 依赖；SceneRenderBridge 经 `MaterializeTexture` 保留完整 mip 链与 format，
+  hdrp-bgfx 的 MaterialSystem/ParcelMaterialSystem 均可直接上传。
 - 去重：无 skin 的 mesh 按内容 hash 去重；material 按内容 hash 去重；外部纹理沿用
   canonical texture GUID（文件内容 + 纹理设置）。
 - 压缩：`EXT_meshopt_compression` 支持 ATTRIBUTES/TRIANGLES/INDICES 三种 mode 与
   NONE/Octahedral/Quaternion/Exponential filter；使用内置 meshoptimizer 解码后
   覆盖 bufferView 数据，单 bufferView 与累计解码均受 512 MiB 限制。
-- 限制：Draco/basisu/WebP 的 required extension 返回 Unsupported；
-  KHR_texture_transform 尚未映射；未选中 scene 的 mesh/material 仍会 cook。
-  多个 node 复用同一 skinned mesh 且 skin joint 顺序不同时按各自 SkinComponent 解释，
-  建议使用同一 skeleton。
+- KHR_texture_transform：仅使用 UV0。所有已映射纹理共享同一 transform 时，把
+  `offset/rotation/scale` 在导入期烘入 `TEXCOORD_0`，保持 hdrp-bgfx 原 shader
+  只采样 UV0；逐贴图 transform 不同时，改为按 `(源图, transform, sampler, sRGB)`
+  生成烘焙后的 TextureAsset 变体，网格 UV0 保持原值。使用 `texCoord != 0` 时保留
+  原始 UV0 并追加 warning。逐贴图烘焙会增加 cook 时间、纹理内存和包体；变体使用
+  默认 texture 编码设置（不继承外部纹理的 `.parcelmeta` 覆盖）。
+- 限制：Draco/basisu/WebP 的 required extension 返回 Unsupported；未选中 scene
+  的 mesh/material 仍会 cook。
+  外部 buffer/image 可包含 `..` 父目录段，但解析后的路径必须仍位于 project root
+  内；外部纹理需与 glTF 同批导入以建立 canonical GUID。多个 node 复用同一
+  skinned mesh 且 skin joint 顺序不同时按各自 SkinComponent 解释，建议使用同一
+  skeleton。
 
 ## 6. 纹理
 
@@ -226,15 +235,35 @@ Cooked Assets + .parcelmeta + ImportDB
 - StaticAssetCollector：参与打包，不写入可加载列表。
 - DependAssetCollector：只作为依赖参与；零引用则剔除。
 - 地址规则：Address / AssetPath / GUID 三选一或组合。
-- 打包规则：按目录/标签/显式列表；共享资源独立 Bundle（可配置）。
+- 过滤规则 `filterRule`：按 cooked 资产类型选择，默认 `CollectAll`。
+  - `CollectAll`、`CollectScene`、`CollectShader`、`CollectRaw`、`CollectVideo`、
+    `CollectTexture`、`CollectMaterial`、`CollectMesh`、`CollectAnimation`、
+    `CollectText`、`CollectIES`。
+  - `CollectVideo` 仅匹配源路径为视频扩展名的 RawFileAsset。
+  - `CollectPrefab`、`CollectSprite`、`CollectShaderVariants` 对 Parcel cooked 资产不适用，
+    配置后 pack 返回 `Unsupported`。
+- 打包规则 `packRule`：默认 `Default` 保持原有目录/依赖/Shader/Raw 行为。
+  - `PackSeparately`：每个资产单独 Bundle，名为 `separate/<guid>`。
+  - `PackDirectory`：资产所在目录。
+  - `PackTopDirectory`：资产路径第一级目录。
+  - `PackCollector`：collector 名；`PackGroup`：`group`，未设置时退回 collector 名。
+  - `PackRawFile` / `PackVideoFile`：匹配 RawFileAsset（视频规则再检查源扩展名），
+    名为 `raw/<guid>`。
+  - `PackShader`：ShaderLibraryAsset 进入 `shaders/<collector>`。
+  - `PackShaderVariants` 不支持，pack 返回 `Unsupported`。
+  - 显式 `bundle` 始终优先于 `packRule`；`.parcelmeta` source group 也会强制同组。
 - 标签：流向 Bundle tags，用于首包/按标签下载。
-- Shader 自动独立 Bundle；Raw 文件单独 Bundle。
+- Shader 自动独立 Bundle；Raw 文件默认单独 Bundle，`archive=true` collector 可将多个 raw 写入同一 archive Bundle。
+- Pack 可选扫描 `source`（默认 project root）下的 `.parcelmeta`，将 cooked GUID 映射回
+  源相对路径；`useSourcePath=true`（默认）时主资产 Manifest path/AssetPath 地址优先使用
+  源路径。
 
 ## 12. Bundle 分配
 
-- 主资产 + 子资产同 Bundle，避免拆散。
+- 主资产 + 子资产同 Bundle，避免拆散；有 `.parcelmeta` 时按 `sourceGuid` 强制归组。
+- 组内显式 `bundle` 必须一致，否则构建失败；Raw 文件不能与其它资产同组。
 - 共享资源被多个 Bundle 引用时独立共享 Bundle；单引用可并入引用者。
-- Raw Bundle：一个文件一个 Bundle。
+- Raw Bundle：默认一个文件一个 Bundle；archive collector 例外。
 - Bundle 依赖图必须无环；Packer 构建期校验。
 - Bundle 粒度：可按目录/Collector 配置；避免一个资源一个 Bundle 或超大 Bundle。
 
@@ -260,10 +289,13 @@ output/
 
 ## 14. 确定性/增量
 
-- 稳定 GUID、稳定排序、固定时间戳或去掉时间戳。
+- 稳定 GUID、稳定排序；Manifest/Bundle 无时间戳。
 - 内容寻址 Bundle 文件名；同一输入字节级可复现。
 - 增量：ImportDB + BuildDB；资产 hash + Bundle 成员 + 工具版本决定是否重建。
+- 文件级增量：BuildDB 记录资产路径、size/mtime、hash、类型、依赖和报告统计；未变化资产
+  不重新读取/解析。Bundle 需要重建时，按需读取并校验 hash 后再写入 payload。
 - Bundle 成员变化会触发 Bundle 重建；Manifest 每次重新生成。
+- `build_report.json` 的 `reusedBundleCount`/`reusedAssetCount` 可用于确认增量命中。
 - 构建报告记录工具版本/编码器版本/参数。
 
 ## 15. Pack CLI
@@ -276,10 +308,11 @@ parcel_pack \
   --target windows \
   --cooked <cooked-dir> \
   --output <build-dir> \
-  --config <pack-config.json>
+  --config <pack-config.json|toml> \
+  --verify-output
 ```
 
-退出码非 0 表示构建失败；CI 必须检查。
+退出码非 0 表示构建失败；CI 必须检查；`--verify-output` 可选。
 
 
 ## 16. R03 已实现契约
@@ -335,11 +368,13 @@ cmake --preset windows-debug -DPARCEL_ASSIMP_ROOT=E:/Learn/assimp
   无法解析的骨骼/越界 morph target 追加 warning，probe 无有效 texture 时跳过。
 - 同一 FBX 导入内，material/mesh 按编码内容 hash 去重；纹理源按“内容 + 设置”选择
   canonical TextureAsset GUID，所有引用共享同一 cooked 资产。
-- glTF importer v6：内置 cgltf，支持 `.gltf`/`.glb`、external/data URI buffer、
+- glTF importer v9：内置 cgltf，支持 `.gltf`/`.glb`、external/data URI buffer、
   mesh/material/node/camera/KHR_lights_punctual、KHR_materials_variants、
-  EXT_meshopt_compression、scene 选择、skin、morph targets、TRS/Weights 动画与
-  sidecar override；embedded image 解码为纹理子资产；无 skin mesh/material 按内容去重，
-  外部纹理复用 canonical GUID。
+  KHR_texture_transform（共享 UV0 transform 烘入 `TEXCOORD_0`，逐贴图 transform
+  烘焙纹理变体）、EXT_meshopt_compression、scene 选择、skin、morph targets、
+  TRS/Weights 动画与 sidecar override；external buffer/image 的父目录相对路径在
+  project root 内可解析；embedded image 解码为纹理子资产；无 skin mesh/material
+  按内容去重，外部纹理复用 canonical GUID。
 
 ## 17. R04 已实现契约
 
@@ -347,13 +382,27 @@ cmake --preset windows-debug -DPARCEL_ASSIMP_ROOT=E:/Learn/assimp
 
 - `parcel_pack` 静态库；CLI CMake target `parcel_pack_cli`，输出
   `parcel_pack.exe`。
-- 配置 schema：`schemas/parcel.pack.schema.json`。
-- 顶层字段：`package/version/target/cooked/output`、压缩/块大小、manifest flags、
+- 配置 schema：`schemas/parcel.pack.schema.json`；CLI 同时接受 `.json` 和 `.toml`，
+  两种格式共享同一字段语义。
+- 顶层字段：`package/version/target/source/cooked/output`、压缩/块大小、manifest flags、
   `autoCollectShaders`、`writeBuiltinCatalog`、`enableShareBundle`、
-  `singleReferencedPackAlone`、`clean`。
+  `useSourcePath`、`forceSubAssetGrouping`、`singleReferencedPackAlone`、`clean`、`verifyOutput`、
+  `outputNameStyle`、`buildBundleType`。
+- 构建输出参数：
+  - `outputNameStyle=0/1`（HashName）：`<bundleGuid>.bundle`，保持旧行为。
+  - `outputNameStyle=2`（BundleName）：bundle 名中的路径分隔符和非文件名字符转为 `_`，再追加 `.bundle`。
+  - `outputNameStyle=3`（BundleNameHashName）：`<sanitized-bundle-name>_<bundleGuid>.bundle`。
+  - `buildBundleType=0/1`（AssetBundle）：常规 PRCL，archive 由 collector `archive` 控制。
+  - `buildBundleType=3`（Archive）：所有 RawFileAsset 强制走 archive raw；`2`（RawFile）暂不支持，返回 `Unsupported`。
 - `collectors[]` 支持 `main/static/depend`、目录或 `files` 显式列表、递归、
-  `assetPath/fileName/guid/prefix/address` 地址规则、`addressPrefix`/`address`、
-  `tags`、显式 `bundle`、`share`。
+  `include`/`exclude` glob、`assetPath/fileName/guid/prefix/address` 地址规则、
+  `addressPrefix`/`address`、`tags`、显式 `bundle`、`share`、`archive`；
+  以及 `group`、`packRule`、`filterRule`。规则名大小写不敏感，schema 使用
+  YooAsset 风格 PascalCase（如 `PackDirectory`、`CollectMaterial`）。
+- `include`/`exclude` 模式相对 collector 的 `path`（默认 cooked root），大小写敏感；
+  支持 `*`（不跨 `/`）、`**`（跨 `/`，`**/` 可匹配零层目录）、`?`、`[abc]`、
+  `[!abc]`。`include` 会递归扫描目录，`exclude` 在文件列表/目录扫描/include 之后过滤；
+  `files` 仍按精确相对路径处理。
 - 从 cooked 目录读取 `<guid>.prca`；GUID 以文件名为权威。PRCA 必须恰好包含一个
   object；object 的 TypeTable 名称作为 manifest `typeName`。
 - 资产依赖只从 PRCA `ExternalRefTable` 读取；缺失依赖报错。Depend 资产未被
@@ -363,17 +412,42 @@ cmake --preset windows-debug -DPARCEL_ASSIMP_ROOT=E:/Learn/assimp
 ### 17.2 Bundle 分配
 
 - 默认按资产所在目录分 Bundle；collector 的 `bundle` 可显式覆盖。
-- ShaderLibraryAsset 默认进入 `shaders` 共享 Bundle；RawFileAsset 每个资产单独
-  Bundle，Raw Bundle 多文件会失败。
+- `packRule` 可覆盖默认 Bundle 名：`PackSeparately`、`PackDirectory`、
+  `PackTopDirectory`、`PackCollector`、`PackGroup`、`PackRawFile`、`PackVideoFile`、
+  `PackShader`。显式 `bundle` 和 source group 优先于 `packRule`。
+- ShaderLibraryAsset 默认进入 `shaders` 共享 Bundle；RawFileAsset 默认每个资产单独
+  Bundle，非 archive 的 Raw Bundle 多文件会失败。
+- collector 设置 `archive=true` 时，其 RawFileAsset 不再写 PRCA payload，而是把原始
+  raw bytes 写入 PRCL TOC 的 `raw_files`；同一 archive bundle 可包含多个 raw 文件。
+  bundle 名优先使用显式 `bundle`，否则为 `archive/<collector.name>`。Raw 文件名取
+  manifest `assetPath`（`replaceAssetPathWithAddress=true` 时为 address），必须唯一且为
+  安全相对路径。Archive raw 的 Manifest asset 设置 asset flag bit 0，运行时
+  `LoadRawFile` 从 TOC 读取；`OpenRawFile` 可直接按 range 读取 TOC raw。非 archive raw
+  行为不变，`OpenRawFile` 会物化一次后提供 range 读取。
 - Depend 资产被多个 Bundle 引用时进入 `shared/<目录>`；单引用且
   `singleReferencedPackAlone=false` 时并入引用者 Bundle。
 - Bundle GUID 由 package、bundle 名、压缩参数、工具版本、成员 GUID+资产 hash
   派生；文件名 `<bundle-guid>.bundle`。
-- 每个 PRCA 作为 Bundle 的一个 payload，按成员 GUID 稳定排序并 8 字节对齐；
-  payload 的 `mainAssetGuid` 为 cooked 资产 GUID。
+- 每个非 archive PRCA 作为 Bundle 的一个 payload，按成员 GUID 稳定排序并 8 字节对齐；
+  payload 的 `mainAssetGuid` 为 cooked 资产 GUID；archive raw 与 payload 共用逻辑流但
+  使用独立的 TOC 范围。
 - Bundle 依赖图来自资产 ExternalRefTable 的跨 Bundle 边；构建期检查循环依赖。
 
-### 17.3 输出
+### 17.3 源路径映射与子资产组包
+
+- `parcel_pack` 新增 `--source <dir>`；配置顶层 `source` 可覆盖扫描根，默认使用
+  `project root`。Pack 递归扫描其中 `*.parcelmeta`，按 meta 文件位置推导项目相对源路径。
+- `.parcelmeta` 的 `sourceGuid` 作为源组；`assets[].guid` 全部登记到该组。主资产按
+  `scene > texture > shader > mesh > material > animation > raw > text > ies` 选择；
+  `useSourcePath=true`（默认）时主资产的 Manifest `asset_path` 与 `assetPath` 地址使用
+  源路径，子资产保留 cooked 路径以避免同源多资产路径冲突。
+- `forceSubAssetGrouping=true`（默认）时，同源资产强制进入同一个 Bundle；组内显式
+  `bundle` 必须一致。组名默认取源路径父目录，全部为 Shader 时使用 `shaders`。
+- Raw 资产不能与同源其它资产组包；构建返回 `InvalidArgument`。
+- `sourcePath` 写入 `build_report.json`；没有 meta 映射的资产行为不变。
+- 非法/不可读 `.parcelmeta` 记录 warning 并跳过；重复 GUID 或同一源组路径冲突会失败。
+
+### 17.4 输出
 
 CLI 参数：
 
@@ -383,9 +457,10 @@ parcel_pack \
   --package game \
   --version 1.0.0 \
   --target windows \
+  --source <source-dir> \
   --cooked <cooked-dir> \
   --output <build-root> \
-  --config <pack-config.json>
+  --config <pack-config.json|toml>
 ```
 
 配置示例：
@@ -395,8 +470,12 @@ parcel_pack \
   "package": "game",
   "version": "1.0.0",
   "target": "windows",
+  "source": "assets",
   "cooked": "cooked",
   "output": "build",
+  "useSourcePath": true,
+  "forceSubAssetGrouping": true,
+  "verifyOutput": true,
   "compression": "lz4",
   "blockSize": 262144,
   "collectors": [
@@ -404,47 +483,81 @@ parcel_pack \
       "name": "main",
       "type": "main",
       "path": "assets",
+      "include": ["**/*.prca"],
+      "exclude": ["**/debug/**"],
       "addressRule": "assetPath",
-      "tags": ["base"]
+      "tags": ["base"],
+      "filterRule": "CollectAll",
+      "packRule": "PackDirectory"
     },
     {
       "name": "textures",
       "type": "depend",
       "path": "textures",
-      "addressRule": "fileName"
+      "addressRule": "fileName",
+      "filterRule": "CollectTexture",
+      "packRule": "PackTopDirectory"
     }
   ]
 }
 ```
 
+也可以使用 `.toml` 配置（顶层键值 + `[[collectors]]`）：
+
+```toml
+package = "game"
+version = "1.0.0"
+cooked = "cooked"
+output = "build"
+verifyOutput = true
+
+[[collectors]]
+name = "main"
+type = "main"
+path = "assets"
+include = ["**/*.prca"]
+exclude = ["**/debug/**"]
+addressRule = "assetPath"
+tags = ["base"]
+```
+
+TOML 支持基本/字面量字符串、十进制整数、布尔、数组、注释和多行数组；collector 使用
+`[[collectors]]`。不支持多行字符串、dotted keys、inline tables 和 `[section]`。
+顶层字段应写在第一个 `[[collectors]]` 之前。
+
 `--output` 是构建根目录，最终包目录为
 `<output>/<target>/<package>/<version>/`：
 
 ```text
-bundles/<bundle-guid>.bundle
+bundles/<bundle-guid>.bundle    # outputNameStyle 0/1；2/3 见构建输出参数
 manifest.bytes
 manifest.hash                 # PRCM content hash，hex + newline
 <package>.version
 build_report.json
 build_db.json
+builtin_catalog.bin          # writeBuiltinCatalog=false 可关闭
 ```
 
 - Manifest 只写 Main 资产；Static/Depend 参与 Bundle，但不进入可加载 AssetList。
   Asset 记录包含 address/path/type/bundle/payload/localObject/dependency bundle/tags。
+  Archive raw 的 asset flags bit 0 为 `ArchiveRaw`，此时 `payload/localObject` 为 0，
+  `assetPath` 即 TOC raw 文件名；`LoadRawFile` 返回原始 raw bytes。
 - `manifest.hash` 为 `ManifestHeader.content_hash`，即 `[header_size,file_size)`
   的 SHA-256，与 R01 的 `LoadManifestFile` 校验语义一致。
-- `build_db.json` 记录工具版本、Bundle 名/GUID/文件名/file hash、成员 GUID+hash；
-  未变化 Bundle 校验文件 hash 后复用，Manifest 每次重建。
+- `build_db.json`（version 2）记录工具版本、Bundle 名/GUID/文件名/file hash、成员 GUID+hash，
+  以及资产的相对路径、size/mtime、hash、类型、依赖和纹理/Shader 报告统计。
+  未变化 Bundle 校验文件 hash 后复用；未变化资产直接复用元数据/统计，Manifest 每次重建。
 - `build_report.json` 记录工具版本/压缩参数、总大小、Bundle/资产依赖、资产类型、纹理格式、Shader
-  variant/backend、未使用资产、零引用、重复内容、告警和错误。
+  variant/backend、未使用资产、零引用、重复内容、增量命中统计、输出校验状态（`outputVerified`/`verifiedBundleCount`）、告警和错误。
 - Bundle payload 压缩会并行构建；Manifest 输出稳定排序，重复打包字节级一致。
 - 失败构建返回非零并写 `build_report.json`；`--clean` 删除新计划之外的旧
   `.bundle` 文件。
-- 未实现/延后：加密 hook、文件级增量（当前按 Bundle 复用）、`.parcelmeta`
-  源路径映射、基于 meta 的 main+subasset 强制组包、复杂 glob/TOML collector、
-  archive bundle。
-
-
+- 可选输出校验：`verifyOutput=true` 或 CLI `--verify-output` 会在写完后重新读取
+  `manifest.bytes`/`manifest.hash`/`<package>.version`/全部 Bundle（以及存在时的
+  `builtin_catalog.bin`），对比大小、SHA-256、CRC32 和 catalog 条目；不一致返回
+  `HashMismatch` 并写入失败报告。`parcel::pack::VerifyPackOutput()` 可单独调用。
+- 已实现 Bundle + 文件级增量、collector `include`/`exclude` glob、JSON/TOML 配置、
+  archive bundle、`packRule`/`filterRule`/`group`；未实现/延后：加密 hook。
 
 
 

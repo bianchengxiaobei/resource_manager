@@ -1,4 +1,4 @@
-﻿# R08 Go 服务端与 Vue 管理端
+# R08 Go 服务端与 Vue 管理端
 
 ## 目标
 
@@ -16,15 +16,14 @@ R07（客户端协议/配置 schema）；可并行开发。
 ## 状态
 
 主体完成。已落地 Go 服务端、Vue 管理端、CLI、OpenAPI、Docker/nginx/备份脚本；
-端到端 API 测试覆盖上传/发布/灰度/回滚/签名 URL/Range/401/403/404/429/路径穿越。
+端到端 API 测试覆盖上传/发布/灰度/回滚/重命名/删除/签名 URL/Range/401/403/404/409/429/路径穿越。
 
 明确延期：
 
-- Docker/nginx TLS 真实启动 smoke；当前环境未安装 Docker。
-- Playwright smoke（可选）。
-- 包/版本的破坏性删除/重命名；当前提供创建、列表、详情、上传、发布、回滚、渠道切换。
+- Docker 容器真实启动 smoke；当前环境未安装 Docker。Windows nginx 1.27.5 + 本地 CA
+  签发证书（Go TLS probe 校验证书链和主机名）的 HTTP→HTTPS、静态 UI、登录和建包
+  代理 smoke 已通过 `scripts/run-nginx-smoke.ps1`。
 - 大规模并发/断点压力测试；当前覆盖 Range 与并发安全基础。
-- CLI `gray` 仅创建规则；更新/删除通过管理端/HTTP API。
 
 ## 范围
 
@@ -43,11 +42,16 @@ R07（客户端协议/配置 schema）；可并行开发。
 - [x] SQLite schema + migrations。
 - [x] 本地 blob 存储（SHA-256 内容寻址、原子写）。
 - [x] 上传 API：multipart/流式、SHA-256 校验、大小限制。
-- [x] 包/版本/渠道 CRUD。
+- [x] 包/版本/渠道 CRUD，含包/版本重命名与破坏性删除（确认参数、引用保护、blob 清理）。
 - [x] 发布/回滚。
 - [x] 审计日志。
 - [x] Prometheus `/metrics`、`/healthz`。
 - [x] Dockerfile + docker-compose + nginx TLS + volume + backup 脚本。
+- [x] Windows nginx TLS 代理 smoke（本地 CA 签发证书；HTTP→HTTPS、HTTPS
+  `/healthz`、静态 UI、管理员登录/建包；Go probe 校验证书链；Docker 容器启动
+  仍未验证）。
+- [x] OpenAPI 契约测试：实际 method/path 与 `api/openapi.yaml` 双向一致，主要 schema
+  JSON 字段与 Go tag 一致；TS schema 生成无 diff，`vue-tsc`/Vite 构建通过。
 
 ### 鉴权
 
@@ -79,15 +83,15 @@ R07（客户端协议/配置 schema）；可并行开发。
 - [x] Vue 3 + TS + Vite + Element Plus。
 - [x] OpenAPI 生成 TS client。
 - [x] 登录/登出/CSRF。
-- [x] 包/版本列表；上传/发布。
+- [x] 包/版本列表；上传/发布/重命名/删除。
 - [x] 渠道/灰度规则/回滚。
 - [x] 审计/指标页面。
 - [x] 上传进度/错误提示/权限。
-- [ ] Playwright smoke（可选，延后）。
+- [x] Playwright smoke（`e2e/admin.spec.ts`：登录、创建包、上传两个版本、发布、回滚、创建/编辑/删除灰度规则、审计分页/指标页、登出；使用系统 Edge headless，`scripts/run-webui-smoke.ps1` 启动临时服务端）。
 
 ### CLI
 
-- [x] `parcel-admin upload/publish/rollback/gray/backup/restore`。
+- [x] `parcel-admin upload/publish/rollback/rename-package/delete-package/rename-version/delete-version/gray/gray-update/gray-delete/backup/restore`。
 - [x] 退出码/日志/配置。
 
 ## 验收标准

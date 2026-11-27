@@ -21,6 +21,7 @@ var (
 	ErrNotFound = errors.New("not found")
 	ErrConflict = errors.New("conflict")
 	ErrInvalid  = errors.New("invalid argument")
+	ErrInUse    = errors.New("resource is in use")
 )
 
 type Store struct {

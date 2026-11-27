@@ -1,4 +1,4 @@
-﻿# 09 构建、测试与 CI
+# 09 构建、测试与 CI
 
 ## 1. C++ 构建
 
@@ -88,10 +88,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1 `
 
 ### 单元测试（C++）
 
-当前已验证（hbg-disabled Debug，主套件 206 cases / 5803 assertions；性能用例另计 1 case / 5022 assertions）：Result/Error、日志、
+当前已验证（hbg-disabled Debug，主套件 272 cases / 10252 assertions；性能用例另计 1 case / 5022 assertions）：Result/Error、日志、
 路径、SHA-256/CRC32、文件、时间、线程池、Operation/Scheduler、Guid128、二进制读写、
 压缩、PRCA/PRCL/PRCM、Manifest 零拷贝查找、FlatBuffers 可选 metadata 测试、golden
-files、资产/组件/Scene schema、sidecar JSON/组件映射、内容 hash 去重、导入/打包、Runtime 同步/异步加载、
+files、资产/组件/Scene schema、sidecar JSON/组件映射、内容 hash 去重、导入/打包（含 JSON/TOML 配置、collector include/exclude glob、archive raw bundle）、Runtime 同步/异步加载、archive/non-archive raw `OpenRawFile` range 读取、
 Handle 生命周期、Runtime Scene 实例化/卸载、AnimationClip/AnimationPlayer、SkinComponent/蒙皮顶点、MorphComponent/morph target、Light cookie/IES 导入与采样、BuiltinCatalog 编解码/包名校验/回退、Bundle 缓存校验、Sandbox footprint/覆盖安装清理、操作耗时/下载吞吐、下载/续传/CDN/Token/灰度/Manifest 缓存、
 Signed URL 缓存/403 重签、截断/随机 fuzz、安全边界拒绝、并发/卸载/重建压力。
 - 结果/错误、路径、hash、线程池、Operation 调度。
@@ -109,7 +109,7 @@ Signed URL 缓存/403 重签、截断/随机 fuzz、安全边界拒绝、并发/
 - mock `ISceneLoader` 两阶段加载契约。
 - Handle/Provider/BundleLoader 引用计数。
 - Pack：配置解析、collector/地址/标签、共享 Bundle、Raw 多文件拒绝、缺失/循环依赖、
-  确定性输出、`build_db.json` 增量复用、Manifest 加载。
+  确定性输出、`build_db.json` Bundle/文件级增量复用、输出 hash/catalog 校验、Manifest 加载。
 
 直接运行：
 
@@ -132,11 +132,11 @@ parcel_import --project <project> --source <assets> --output <cooked> --db <impo
 ```powershell
 cmake --build --preset windows-debug --target parcel_pack_cli
 parcel_pack --project <project> --package game --version 1.0.0 --target windows `
-  --cooked <cooked> --output <build-root> --config <pack-config.json>
+  --cooked <cooked> --output <build-root> --config <pack-config.json|toml>
 ```
 
-输出位于 `<build-root>/<target>/<package>/<version>/`。`--config` 可省略；配置格式见
-`schemas/parcel.pack.schema.json`。
+输出位于 `<build-root>/<target>/<package>/<version>/`。`--config` 可省略；JSON/TOML
+字段语义见 `schemas/parcel.pack.schema.json` 和 `docs/04-import-pack.md`。
 
 生成 golden 文件（仅在格式变更后需要）：
 
@@ -238,8 +238,9 @@ cmake --build build/windows-bench --config Release --target parcel_bench
 
 ## 5. CI
 
-- Windows MSVC：Debug/Release、no-exceptions/no-rtti、ASan（已验证；Release 主套件
-  225 cases / 6162 assertions，性能 1 case / 5022 assertions；ASan 206 cases / 5803 assertions，48.65s）。
+- Windows MSVC：Debug/Release、no-exceptions/no-rtti、ASan（已验证；Debug 主套件
+  284 cases / 15730 assertions，性能 1 case / 5022 assertions；Release 282 / 13072；
+  ASan 282 / 13072）。
 - Windows ClangCL：UBSan（已验证，225 cases / 6162 assertions，0 runtime error；该构建启用 hbg 测试）。
 - assimp 启用：227 cases / 8820 assertions（含真实 `animation_with_skeleton.fbx` 动画/蒙皮与 `morph_animation.fbx` morph 导入 smoke）。
 - Clang/Linux：ASan/UBSan/TSan；CMake 选项 `PARCEL_ENABLE_ASAN/UBSAN/TSAN`（Windows ClangCL 走 UBSan 脚本），

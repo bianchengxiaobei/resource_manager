@@ -1,4 +1,4 @@
-﻿# 10 里程碑与验收
+# 10 里程碑与验收
 
 ## 估算前提
 
@@ -26,7 +26,7 @@
 
 ## M1 格式 + 资产 + 导入 + 打包（约 8-10 周）
 
-状态：已完成（R01/R02/R03/R04 完成；R04 加密/TOML 为明确延期项）。
+状态：已完成（R01/R02/R03/R04 完成；R04 加密为明确延期项，TOML/archive bundle 已实现）。
 
 交付：
 
@@ -35,7 +35,7 @@
 - `.parcelmeta`、ImportDB、FBX/assimp 与 glTF/GLB 导入。
 - 纹理 PNG/TGA/JPG/HDR、RGBA16F/32F 与 BC1/BC3/BC5/BC7 编码。
 - ShaderLibraryAsset 打包。
-- Collector/依赖/Bundle/Manifest/Report。
+- Collector/依赖/Bundle/Manifest/Report（含 JSON/TOML、glob、archive raw、PackRule/FilterRule/group、outputNameStyle/buildBundleType）。
 - `parcel_import` / `parcel_pack` CLI。
 
 验收：
@@ -47,7 +47,7 @@
 
 ## M2 Runtime 核心（约 5-6 周）
 
-状态：进行中（R05 完成；R06 Runtime Scene 生命周期、Light cookie/IES 采样与 EnTT Scene 加载完成，GPU 端到端待补；R07 已提供下载修复）。
+状态：进行中（R05 完成，含 Auto/EditorSimulate/Offline/Host 运行时模式与松散 cooked PRCA 直读；R06 Runtime Scene 生命周期、Light cookie/IES 采样与 EnTT Scene 加载完成，合成/真实包/Proland 真实资产 GPU 端到端 smoke 已通过；R07 已提供下载修复）。
 
 交付：
 
@@ -68,7 +68,7 @@
 
 ## M3 热更 + 服务端 + Vue（约 8-10 周）
 
-状态：主体完成（R07 客户端/下载/Manifest/灰度、R08 Go 服务端/Vue/CLI/OpenAPI/Docker 文件已完成；Docker/WinHTTP 真实网络 smoke、Playwright 和大规模压力测试延后）。
+状态：主体完成（R07 客户端/下载/Manifest/灰度、R08 Go 服务端/Vue/CLI/OpenAPI/Docker 文件、WinHTTP 真实网络、Playwright 管理端 smoke（登录/建包/上传/发布/回滚/灰度创建编辑删除/审计分页/指标/登出）和 Windows nginx TLS 代理 smoke 已完成；Docker 容器启动和大规模压力测试延后）。
 
 交付：
 
@@ -89,7 +89,7 @@
 
 ## M4 hdrp-bgfx 适配 + 运行时扩展（约 6-8 周）
 
-状态：进行中（R06 CPU 适配/Scene/Shader/Settings、节点动画、蒙皮与 morph 主体完成；R09 硬化基线已开始；真实 ForwardRenderer 待验证）。
+状态：进行中（R06 CPU 适配/Scene/Shader/Settings、节点动画、蒙皮与 morph 主体完成；R09 硬化基线已开始；合成与真实 Parcel 包资产的 ForwardRenderer GPU smoke 已在 Windows/D3D12/D3D11/Vulkan 验证，包内 ShaderLibraryAsset 经 Bootstrap 内容寻址物化（blob 跨版本复用，硬链接/复制回退）后已驱动真实 dxbc/spirv ShaderLibrary，10000 静态实例已在 D3D12 验证，Proland 60067-node 和 OceanSphere 真实资产已完成导入/打包/D3D12/D3D11/Vulkan smoke；相对原 hdrp render-test 的帧预算和轻量 fractal_lod 场景绝对 60 fps 门禁已通过；baked terrain LOD 选择、heightmap tile cache 的精确 node bounds/ground、CPU shared-grid 顶点变形、1km mesh + 500m submesh 的 60k vegetation frustum/5000m 距离剔除及 near/far LOD、CPU water FFT、CPU river mesh/terrain carve、river material 纹理、逐帧 wave normal、屏幕空间 Poisson foam 播种和 CPU foam 逐帧动画已支持，GPU shader 顶点变形、material tiles、逐实例 vegetation GPU instancing、GPU FFT 纹理和 GPU river particles/refraction 未覆盖）。
 
 交付：
 
@@ -100,11 +100,11 @@
 
 验收：
 
-- Parcel Scene 能驱动 hdrp-bgfx `RenderScene` 渲染。
-- BC7/HDR/mip 纹理正确；ShaderLibrary 正常加载。
+- Parcel Scene 能驱动 hdrp-bgfx `RenderScene` 渲染（合成场景与真实 Parcel 包资产在 D3D12/D3D11/Vulkan GPU smoke 已验证，10000 静态实例在 D3D12 已验证，Proland 60067-node 真实资产三后端已验证）。
+- BC7/HDR/mip 纹理正确；ShaderLibrary 正常加载（GPU smoke 已验证；包内 ShaderLibraryAsset 经 Bootstrap 内容寻址物化（blob + 硬链接/复制回退）后已驱动未修改的 dxbc/spirv ShaderLibrary）。
 - 材质/灯光/相机/Decal/Probe/Fog 字段对齐；节点动画映射到 RenderScene.animations，
   蒙皮 joint/逆绑定矩阵映射到 RenderScene.skins；morph targets 与 Weights 通道映射到 mesh/object/node weights。
-- ASan/TSan（可行时）通过；目标规模性能达标。
+- ASan/TSan（可行时）通过；目标规模性能达标（10000 静态实例结构验证已通过，Proland 60067-node 真实资产已完成 D3D12/D3D11/Vulkan smoke；相对原 hdrp render-test 的帧预算和轻量 fractal_lod 绝对 60 fps 已通过，其他项目资产待测）。
 
 ## R09 稳固/发布（进行中）
 
@@ -118,8 +118,13 @@
 - `docs/12-security-review.md`、`THIRD_PARTY_NOTICES.md`、`CHANGELOG.md`。
 - `examples/hello-package` 全链路示例与 `scripts/package-release.ps1`。
 
-待补：TSan 实机、真实 CDN/TLS 连接复用/吞吐、Docker/nginx/Playwright。
-WinHTTP loopback smoke 已通过 `scripts/run-winhttp-smoke.ps1`。
+待补：TSan 实机（Windows Clang 不支持，需 Linux/CI）、真实 CDN 边缘签名/鉴权流程、
+Docker 容器启动。WinHTTP loopback smoke 已通过 `scripts/run-winhttp-smoke.ps1`；
+Cloudflare TLS/连接复用/吞吐、GitHub raw 完整安装、真实服务端签名 URL（含
+403/401/过期）、Playwright 管理端和 Windows nginx TLS 代理 smoke 已通过
+`scripts/run-cdn-smoke.ps1` / `scripts/run-cdn-bundle-smoke.ps1` /
+`scripts/run-signed-url-smoke.ps1` / `scripts/run-webui-smoke.ps1` /
+`scripts/run-nginx-smoke.ps1`。
 
 ## M5 Editor（后续）
 

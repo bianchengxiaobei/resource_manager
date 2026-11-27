@@ -31,6 +31,14 @@ class ProviderBase;
     std::shared_ptr<IHttpTransport> download_transport,
     std::shared_ptr<IDownloadUrlProvider> download_url_provider, DownloadOptions options);
 
+[[nodiscard]] core::Result<std::shared_ptr<ResourceUnpacker>>
+MakeBundleUnpacker(std::string package_name, ManifestPtr manifest,
+                   std::shared_ptr<FileSystemHost> host, UnpackOptions options);
+
+[[nodiscard]] core::Result<std::shared_ptr<ResourceImporter>>
+MakeBundleImporter(std::string package_name, ManifestPtr manifest,
+                   std::shared_ptr<FileSystemHost> host, BundleImportOptions options);
+
 class HandleState final : public std::enable_shared_from_this<HandleState> {
   public:
     HandleState(std::shared_ptr<ResourcePackageImpl> package,
@@ -119,6 +127,7 @@ class ProviderBase final : public core::OperationBase,
 
   private:
     [[nodiscard]] core::Result<void> LoadBlocking();
+    [[nodiscard]] core::Result<void> LoadSimulate();
     [[nodiscard]] core::Result<void> InstantiateScene();
     void RunWorker();
     void Integrate();
@@ -174,6 +183,8 @@ struct ResourcePackageImpl : public std::enable_shared_from_this<ResourcePackage
 
     [[nodiscard]] AssetHandle Load(std::string_view location, LoadMethod method,
                                    assets::TypeId asset_type, bool async, int priority);
+    [[nodiscard]] core::Result<std::shared_ptr<RawFileReader>>
+    OpenRawFile(std::string_view location);
     [[nodiscard]] AssetHandle LoadBundleFile(std::string_view location);
     [[nodiscard]] AssetHandle LoadBundleFile(const core::AssetGuid& guid);
     [[nodiscard]] AssetHandle MakeFailedHandle(AssetInfo info, LoadMethod method,
@@ -184,6 +195,8 @@ struct ResourcePackageImpl : public std::enable_shared_from_this<ResourcePackage
 
     [[nodiscard]] core::Result<const serialize::ManifestAssetView*>
     ResolveAsset(std::string_view location) const;
+    [[nodiscard]] core::Result<std::vector<std::byte>>
+    ReadSimulateAsset(const core::AssetGuid& guid) const;
     [[nodiscard]] const serialize::ManifestBundleView*
     FindBundle(std::string_view name) const noexcept;
     [[nodiscard]] AssetInfo MakeAssetInfo(const serialize::ManifestAssetView& asset) const;
@@ -208,6 +221,7 @@ struct ResourcePackageImpl : public std::enable_shared_from_this<ResourcePackage
 
     [[nodiscard]] bool loaded_lock() const noexcept { return loading_lock_count.load() > 0; }
     [[nodiscard]] bool HasSceneLoader() const;
+    [[nodiscard]] PlayMode GetPlayMode() const noexcept { return play_mode; }
 
     [[nodiscard]] RuntimeStats Stats() const;
     [[nodiscard]] LeakReport Leaks() const;
@@ -217,8 +231,11 @@ struct ResourcePackageImpl : public std::enable_shared_from_this<ResourcePackage
     core::OperationScheduler* scheduler = nullptr;
     std::unique_ptr<core::OperationScheduler> owned_scheduler;
     ResourcePackageOptions options;
+    PlayMode play_mode = PlayMode::Auto;
     std::string name;
     std::string version;
+    std::string simulate_manifest_path;
+    std::unordered_map<core::AssetGuid, std::string, core::Guid128Hash> simulate_assets;
     std::shared_ptr<FileSystemHost> host;
     ManifestPtr manifest;
     assets::TypeRegistry registry;
@@ -243,6 +260,16 @@ struct ResourcePackageImpl : public std::enable_shared_from_this<ResourcePackage
     bool auto_unload = false;
     std::uint64_t next_provider_id = 0;
     std::uint64_t generation = 0;
+};
+
+struct RawFileReaderImpl {
+    ~RawFileReaderImpl();
+
+    std::shared_ptr<ResourcePackageImpl> package;
+    std::shared_ptr<BundleLoader> bundle;
+    std::shared_ptr<std::vector<std::byte>> memory;
+    std::string raw_name;
+    std::uint64_t size = 0;
 };
 
 } // namespace parcel::runtime

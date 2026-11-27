@@ -1,4 +1,4 @@
-﻿#include "parcel/runtime/resource_package.hpp"
+#include "parcel/runtime/resource_package.hpp"
 
 #include "parcel/assets/asset_codec.hpp"
 #include "parcel/assets/raw_file_asset.hpp"
@@ -6,6 +6,7 @@
 #include "parcel/assets/serializers.hpp"
 #include "parcel/core/path.hpp"
 #include "parcel/runtime/bundle_loader.hpp"
+#include "parcel/serialize/manifest.hpp"
 #include "runtime_internal.hpp"
 
 #include <algorithm>
@@ -13,16 +14,33 @@
 #include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <unordered_set>
 #include <utility>
 
 namespace parcel::runtime {
+std::string_view ToString(PlayMode mode) noexcept {
+    switch (mode) {
+    case PlayMode::Auto:
+        return "Auto";
+    case PlayMode::EditorSimulate:
+        return "EditorSimulate";
+    case PlayMode::Offline:
+        return "Offline";
+    case PlayMode::Host:
+        return "Host";
+    }
+    return "Unknown";
+}
+
 struct PendingDownloadState {
     std::mutex mutex;
     std::condition_variable condition;
@@ -81,6 +99,129 @@ Result<ManifestPtr> OpenManifestBytes(std::vector<std::byte> bytes) {
     }
     return std::make_shared<const serialize::ManifestView>(std::move(opened).Value());
 }
+
+std::filesystem::path Utf8Path(std::string_view path) {
+    return std::filesystem::path(std::u8string(path.begin(), path.end()));
+}
+
+std::string PathToUtf8(const std::filesystem::path& path) {
+    const std::u8string value = path.u8string();
+    return std::string(value.begin(), value.end());
+}
+
+Result<void>
+ScanSimulateAssets(std::string_view root,
+                   std::unordered_map<core::AssetGuid, std::string, core::Guid128Hash>& assets) {
+    const std::filesystem::path root_path = Utf8Path(root);
+    std::error_code error;
+    if (!std::filesystem::exists(root_path, error)) {
+        return MakeError(ErrorCode::NotFound, "simulate root does not exist")
+            .WithPath(std::string(root));
+    }
+    if (error || !std::filesystem::is_directory(root_path, error)) {
+        return MakeError(ErrorCode::InvalidArgument, "simulate root is not a directory")
+            .WithPath(std::string(root));
+    }
+
+    std::filesystem::recursive_directory_iterator iterator(root_path, error);
+    if (error) {
+        return MakeError(ErrorCode::Io, "failed to scan simulate root").WithPath(std::string(root));
+    }
+    const std::filesystem::recursive_directory_iterator end;
+    for (; iterator != end; iterator.increment(error)) {
+        if (error) {
+            return MakeError(ErrorCode::Io, "failed to scan simulate root")
+                .WithPath(std::string(root));
+        }
+        if (!iterator->is_regular_file(error)) {
+            error.clear();
+            continue;
+        }
+        const std::filesystem::path path = iterator->path();
+        if (LowerAscii(core::path::Extension(PathToUtf8(path))) != ".prca") {
+            continue;
+        }
+        const std::string stem = PathToUtf8(path.stem());
+        auto guid = core::Guid128::FromHex(stem);
+        if (!guid) {
+            return MakeError(ErrorCode::Corrupt, "simulate asset filename is not a GUID")
+                .WithPath(PathToUtf8(path));
+        }
+        const auto [it, inserted] = assets.emplace(guid.Value(), PathToUtf8(path));
+        if (!inserted) {
+            (void)it;
+            return MakeError(ErrorCode::InvalidArgument, "duplicate asset GUID in simulate root")
+                .WithAsset(guid.Value().ToHex())
+                .WithPath(PathToUtf8(path));
+        }
+    }
+    if (assets.empty()) {
+        return MakeError(ErrorCode::InvalidArgument, "simulate root contains no cooked assets")
+            .WithPath(std::string(root));
+    }
+    return {};
+}
+
+ManifestPtr MakeManifestPtr(serialize::ManifestView view) {
+    return std::make_shared<const serialize::ManifestView>(std::move(view));
+}
+
+class SimulateResolver final : public assets::IObjectResolver {
+  public:
+    SimulateResolver(ManifestPtr manifest, const assets::TypeRegistry& registry,
+                     ResourcePackageImpl& package)
+        : manifest_(std::move(manifest)), registry_(registry), package_(package) {}
+
+    Result<std::shared_ptr<assets::AssetObject>> Resolve(core::AssetGuid guid) override {
+        const auto cached = cache_.find(guid);
+        if (cached != cache_.end()) {
+            return cached->second;
+        }
+        if (!resolving_.insert(guid).second) {
+            return MakeError(ErrorCode::InvalidArgument, "cyclic simulate asset reference");
+        }
+        const serialize::ManifestAssetView* asset = manifest_->FindAssetByGuid(guid);
+        if (asset == nullptr) {
+            resolving_.erase(guid);
+            return MakeError(ErrorCode::NotFound, "simulate asset is not present in the manifest")
+                .WithAsset(guid.ToHex());
+        }
+        auto bytes = package_.ReadSimulateAsset(guid);
+        if (!bytes) {
+            resolving_.erase(guid);
+            return std::move(bytes).TakeError();
+        }
+        auto decoded = assets::DecodeAssetFileBytes(bytes.Value(), registry_, this);
+        if (!decoded) {
+            resolving_.erase(guid);
+            return std::move(decoded).TakeError();
+        }
+        const auto& objects = decoded.Value().objects;
+        if (objects.empty()) {
+            resolving_.erase(guid);
+            return MakeError(ErrorCode::Corrupt, "simulate asset has no objects")
+                .WithAsset(guid.ToHex());
+        }
+        std::size_t selected = 0;
+        for (std::size_t i = 0; i < decoded.Value().local_ids.size(); ++i) {
+            if (decoded.Value().local_ids[i] == asset->local_object_id) {
+                selected = i;
+                break;
+            }
+        }
+        cache_.emplace(guid, objects[selected]);
+        resolving_.erase(guid);
+        return objects[selected];
+    }
+
+  private:
+    ManifestPtr manifest_;
+    const assets::TypeRegistry& registry_;
+    ResourcePackageImpl& package_;
+    std::unordered_map<core::AssetGuid, std::shared_ptr<assets::AssetObject>, core::Guid128Hash>
+        cache_;
+    std::unordered_set<core::AssetGuid, core::Guid128Hash> resolving_;
+};
 
 class PackageResolver final : public assets::IObjectResolver {
   public:
@@ -446,9 +587,94 @@ void ProviderBase::ReleaseScene() noexcept {
     scene_instance_ = {};
 }
 
+Result<void> ProviderBase::LoadSimulate() {
+    auto bytes = package_->ReadSimulateAsset(asset_->asset_guid);
+    if (!bytes) {
+        return std::move(bytes).TakeError();
+    }
+    SimulateResolver resolver(manifest_, package_->registry, *package_);
+    auto decoded = assets::DecodeAssetFileBytes(bytes.Value(), package_->registry, &resolver);
+    if (!decoded) {
+        return std::move(decoded).TakeError();
+    }
+    const auto& objects = decoded.Value().objects;
+    if (objects.empty()) {
+        return MakeError(ErrorCode::Corrupt, "simulate asset has no objects")
+            .WithAsset(info_.asset_guid.ToHex());
+    }
+
+    const auto select_object = [&](std::uint32_t local_id) -> std::shared_ptr<assets::AssetObject> {
+        for (std::size_t i = 0; i < decoded.Value().local_ids.size(); ++i) {
+            if (decoded.Value().local_ids[i] == local_id) {
+                return objects[i];
+            }
+        }
+        return objects.front();
+    };
+
+    if (method_ == LoadMethod::AllAssets || method_ == LoadMethod::SubAssets) {
+        std::vector<std::shared_ptr<assets::AssetObject>> selected;
+        if (method_ == LoadMethod::AllAssets) {
+            selected = objects;
+        } else {
+            for (const std::uint32_t local_id : decoded.Value().sub_asset_ids) {
+                for (std::size_t i = 0; i < decoded.Value().local_ids.size(); ++i) {
+                    if (decoded.Value().local_ids[i] == local_id) {
+                        selected.push_back(objects[i]);
+                        break;
+                    }
+                }
+            }
+        }
+        if (asset_type_ != assets::kInvalidTypeId) {
+            selected.erase(
+                std::remove_if(selected.begin(), selected.end(),
+                               [&](const auto& object) { return object->Type() != asset_type_; }),
+                selected.end());
+        }
+        std::lock_guard lock(result_mutex_);
+        if (!selected.empty()) {
+            object_ = selected.front();
+        }
+        objects_ = std::move(selected);
+        return {};
+    }
+
+    auto object = select_object(asset_->local_object_id);
+    if (!object) {
+        return MakeError(ErrorCode::Corrupt, "simulate asset object was not found")
+            .WithAsset(info_.asset_guid.ToHex());
+    }
+    if (asset_type_ != assets::kInvalidTypeId && object->Type() != asset_type_) {
+        return MakeError(ErrorCode::InvalidArgument, "asset type does not match the request")
+            .WithAsset(info_.asset_guid.ToHex());
+    }
+    if (method_ == LoadMethod::RawFile) {
+        if (object->Type() != assets::kRawFileAssetType) {
+            return MakeError(ErrorCode::InvalidArgument, "requested asset is not a raw file")
+                .WithAsset(info_.asset_guid.ToHex());
+        }
+        auto raw = std::static_pointer_cast<assets::RawFileAsset>(object);
+        std::lock_guard lock(result_mutex_);
+        object_ = object;
+        objects_.assign(1, object);
+        raw_data_ = std::make_shared<std::vector<std::byte>>(raw->data);
+        return {};
+    }
+    {
+        std::lock_guard lock(result_mutex_);
+        object_ = object;
+        objects_.assign(1, object);
+    }
+    return {};
+}
+
 Result<void> ProviderBase::LoadBlocking() {
     if (!package_ || !manifest_ || asset_ == nullptr) {
         return MakeError(ErrorCode::InvalidArgument, "asset provider has no manifest");
+    }
+    if (package_->play_mode == PlayMode::EditorSimulate) {
+        return LoadSimulate();
     }
     if (asset_->bundle_index >= manifest_->Bundles().size()) {
         return MakeError(ErrorCode::Corrupt, "asset bundle index is out of range")
@@ -512,6 +738,27 @@ Result<void> ProviderBase::LoadBlocking() {
     PackageResolver resolver(manifest_, package_->registry, bundle_map);
     BundleHandle handle(main->second, &package_->registry, &resolver, asset_->payload_id,
                         asset_->local_object_id);
+
+    if ((asset_->flags & serialize::kManifestAssetFlagArchiveRaw) != 0) {
+        if (asset_type_ != assets::kInvalidTypeId && asset_type_ != assets::kRawFileAssetType) {
+            return MakeError(ErrorCode::InvalidArgument, "asset type does not match the request")
+                .WithAsset(info_.asset_guid.ToHex());
+        }
+        auto data = handle.LoadRawFile(asset_->asset_path);
+        if (!data) {
+            return std::move(data).TakeError();
+        }
+        auto object = std::make_shared<assets::RawFileAsset>();
+        object->name.assign(asset_->asset_path);
+        object->data = std::move(data).Value();
+        {
+            std::lock_guard lock(result_mutex_);
+            object_ = object;
+            objects_.assign(1, object);
+            raw_data_ = std::make_shared<std::vector<std::byte>>(object->data);
+        }
+        return {};
+    }
 
     if (method_ == LoadMethod::AllAssets || method_ == LoadMethod::SubAssets) {
         auto result =
@@ -637,6 +884,7 @@ Result<void> ResourcePackageImpl::Initialize(const ResourcePackageOptions& packa
         return MakeError(ErrorCode::InvalidArgument, "resource package is already initialized");
     }
     options = package_options;
+    host.reset();
     owned_pool.reset();
     owned_scheduler.reset();
     pool = std::move(thread_pool);
@@ -667,45 +915,151 @@ Result<void> ResourcePackageImpl::Initialize(const ResourcePackageOptions& packa
         PARCEL_TRY(assets::RegisterStandardAssetSerializers(registry));
     }
 
+    play_mode = options.play_mode;
+    simulate_assets.clear();
+    simulate_manifest_path.clear();
+    if (play_mode == PlayMode::EditorSimulate) {
+        if (!options.file_systems.empty() || !options.builtin_root.empty() ||
+            !options.sandbox_root.empty() || !options.custom_root.empty()) {
+            return MakeError(ErrorCode::InvalidArgument,
+                             "EditorSimulate mode only supports a simulate root")
+                .WithPackage(options.package_name);
+        }
+        if (options.simulate_root.empty()) {
+            return MakeError(ErrorCode::InvalidArgument,
+                             "EditorSimulate mode requires a simulate root")
+                .WithPackage(options.package_name);
+        }
+        if (options.download_transport || options.download_url_provider ||
+            options.download_file_system) {
+            return MakeError(ErrorCode::InvalidArgument,
+                             "EditorSimulate mode does not support downloading")
+                .WithPackage(options.package_name);
+        }
+        auto scanned = ScanSimulateAssets(options.simulate_root, simulate_assets);
+        if (!scanned) {
+            return std::move(scanned).TakeError();
+        }
+        std::filesystem::path manifest_path =
+            options.simulate_manifest.empty() ? Utf8Path(options.simulate_root) / "manifest.bytes"
+                                              : Utf8Path(options.simulate_manifest);
+        auto loaded_manifest = serialize::LoadManifestFile(PathToUtf8(manifest_path), true);
+        if (!loaded_manifest) {
+            return std::move(loaded_manifest).TakeError();
+        }
+        simulate_manifest_path = PathToUtf8(manifest_path);
+        manifest = MakeManifestPtr(std::move(loaded_manifest).Value());
+        name = options.package_name.empty() ? std::string(manifest->PackageName())
+                                            : options.package_name;
+        version = std::string(manifest->PackageVersion());
+        if (!options.package_version.empty()) {
+            version = options.package_version;
+        }
+        initialized = true;
+        return {};
+    }
+
     auto active_host = std::make_shared<FileSystemHost>(options.package_name);
-    if (!options.file_systems.empty()) {
-        for (const auto& file_system : options.file_systems) {
-            active_host->AddFileSystem(file_system);
+    const auto add_builtin = [&] {
+        if (options.builtin_root.empty()) {
+            return;
         }
-    } else {
-        if (!options.builtin_root.empty()) {
-            FileSystemOptions filesystem_options;
-            filesystem_options.package_name = options.package_name;
-            filesystem_options.root = options.builtin_root;
-            filesystem_options.read_only = true;
-            filesystem_options.verify = options.verify_bundle_on_load;
-            active_host->AddFileSystem(
-                std::make_shared<BuiltinFileSystem>(std::move(filesystem_options)));
+        FileSystemOptions filesystem_options;
+        filesystem_options.package_name = options.package_name;
+        filesystem_options.root = options.builtin_root;
+        filesystem_options.read_only = true;
+        filesystem_options.verify = options.verify_bundle_on_load;
+        active_host->AddFileSystem(
+            std::make_shared<BuiltinFileSystem>(std::move(filesystem_options)));
+    };
+    const auto add_sandbox = [&] {
+        if (options.sandbox_root.empty()) {
+            return;
         }
-        if (!options.sandbox_root.empty()) {
-            FileSystemOptions filesystem_options;
-            filesystem_options.package_name = options.package_name;
-            filesystem_options.root = options.sandbox_root;
-            filesystem_options.read_only = false;
-            filesystem_options.verify = options.verify_bundle_on_load;
-            filesystem_options.write_sidecar = options.write_cache_sidecar;
-            filesystem_options.app_build_id = options.app_build_id;
-            filesystem_options.install_cleanup_mode = options.install_cleanup_mode;
-            active_host->AddFileSystem(
-                std::make_shared<SandboxFileSystem>(std::move(filesystem_options)));
+        FileSystemOptions filesystem_options;
+        filesystem_options.package_name = options.package_name;
+        filesystem_options.root = options.sandbox_root;
+        filesystem_options.read_only = false;
+        filesystem_options.verify = options.verify_bundle_on_load;
+        filesystem_options.write_sidecar = options.write_cache_sidecar;
+        filesystem_options.app_build_id = options.app_build_id;
+        filesystem_options.install_cleanup_mode = options.install_cleanup_mode;
+        active_host->AddFileSystem(
+            std::make_shared<SandboxFileSystem>(std::move(filesystem_options)));
+    };
+    const auto add_custom = [&] {
+        if (options.custom_root.empty()) {
+            return;
+        }
+        FileSystemOptions filesystem_options;
+        filesystem_options.package_name = options.package_name;
+        filesystem_options.root = options.custom_root;
+        filesystem_options.read_only = false;
+        filesystem_options.verify = options.verify_bundle_on_load;
+        filesystem_options.write_sidecar = options.write_cache_sidecar;
+        filesystem_options.app_build_id = options.app_build_id;
+        filesystem_options.install_cleanup_mode = options.install_cleanup_mode;
+        active_host->AddFileSystem(
+            std::make_shared<CustomFileSystem>(std::move(filesystem_options)));
+    };
+
+    switch (play_mode) {
+    case PlayMode::Auto:
+        if (!options.file_systems.empty()) {
+            for (const auto& file_system : options.file_systems) {
+                active_host->AddFileSystem(file_system);
+            }
+        } else {
+            add_builtin();
+            add_sandbox();
+            add_custom();
+        }
+        break;
+    case PlayMode::EditorSimulate:
+    default:
+        return MakeError(ErrorCode::Internal, "EditorSimulate mode initialization was not handled")
+            .WithPackage(options.package_name);
+    case PlayMode::Offline:
+        if (!options.file_systems.empty()) {
+            return MakeError(ErrorCode::InvalidArgument,
+                             "Offline mode does not accept custom file systems")
+                .WithPackage(options.package_name);
+        }
+        if (options.builtin_root.empty()) {
+            return MakeError(ErrorCode::InvalidArgument, "Offline mode requires a builtin root")
+                .WithPackage(options.package_name);
+        }
+        if (!options.sandbox_root.empty() || !options.custom_root.empty()) {
+            return MakeError(ErrorCode::InvalidArgument,
+                             "Offline mode only supports a builtin file system")
+                .WithPackage(options.package_name);
+        }
+        if (options.download_transport || options.download_url_provider ||
+            options.download_file_system) {
+            return MakeError(ErrorCode::InvalidArgument,
+                             "Offline mode does not support downloading")
+                .WithPackage(options.package_name);
+        }
+        add_builtin();
+        break;
+    case PlayMode::Host:
+        if (!options.file_systems.empty()) {
+            return MakeError(ErrorCode::InvalidArgument,
+                             "Host mode does not accept custom file systems")
+                .WithPackage(options.package_name);
+        }
+        if (options.sandbox_root.empty()) {
+            return MakeError(ErrorCode::InvalidArgument, "Host mode requires a sandbox root")
+                .WithPackage(options.package_name);
         }
         if (!options.custom_root.empty()) {
-            FileSystemOptions filesystem_options;
-            filesystem_options.package_name = options.package_name;
-            filesystem_options.root = options.custom_root;
-            filesystem_options.read_only = false;
-            filesystem_options.verify = options.verify_bundle_on_load;
-            filesystem_options.write_sidecar = options.write_cache_sidecar;
-            filesystem_options.app_build_id = options.app_build_id;
-            filesystem_options.install_cleanup_mode = options.install_cleanup_mode;
-            active_host->AddFileSystem(
-                std::make_shared<CustomFileSystem>(std::move(filesystem_options)));
+            return MakeError(ErrorCode::InvalidArgument,
+                             "Host mode only supports builtin and sandbox file systems")
+                .WithPackage(options.package_name);
         }
+        add_builtin();
+        add_sandbox();
+        break;
     }
 
     auto initialized_host = active_host->Initialize();
@@ -856,6 +1210,56 @@ ResourcePackageImpl::ResolveAsset(std::string_view location) const {
             .WithAsset(std::string(location));
     }
     return asset;
+}
+
+Result<std::vector<std::byte>>
+ResourcePackageImpl::ReadSimulateAsset(const core::AssetGuid& guid) const {
+    const auto found = simulate_assets.find(guid);
+    if (found == simulate_assets.end()) {
+        return MakeError(ErrorCode::NotFound, "simulate asset file was not found")
+            .WithPackage(name)
+            .WithAsset(guid.ToHex());
+    }
+    std::ifstream file(Utf8Path(found->second), std::ios::binary);
+    if (!file) {
+        return MakeError(ErrorCode::Io, "failed to open simulate asset file")
+            .WithPackage(name)
+            .WithAsset(guid.ToHex())
+            .WithPath(found->second);
+    }
+    file.seekg(0, std::ios::end);
+    if (!file) {
+        return MakeError(ErrorCode::Io, "failed to read simulate asset size")
+            .WithPackage(name)
+            .WithAsset(guid.ToHex())
+            .WithPath(found->second);
+    }
+    const std::streamoff size = file.tellg();
+    if (size < 0) {
+        return MakeError(ErrorCode::Io, "invalid simulate asset size")
+            .WithPackage(name)
+            .WithAsset(guid.ToHex())
+            .WithPath(found->second);
+    }
+    file.seekg(0, std::ios::beg);
+    if (!file) {
+        return MakeError(ErrorCode::Io, "failed to seek simulate asset file")
+            .WithPackage(name)
+            .WithAsset(guid.ToHex())
+            .WithPath(found->second);
+    }
+    std::vector<std::byte> bytes(static_cast<std::size_t>(size));
+    if (!bytes.empty()) {
+        file.read(reinterpret_cast<char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
+        if (!file) {
+            return MakeError(ErrorCode::Io, "failed to read simulate asset file")
+                .WithPackage(name)
+                .WithAsset(guid.ToHex())
+                .WithPath(found->second);
+        }
+    }
+    return bytes;
 }
 
 const serialize::ManifestBundleView*
@@ -1152,6 +1556,12 @@ AssetHandle ResourcePackageImpl::LoadBundleFile(std::string_view location) {
             MakeError(ErrorCode::InvalidArgument, "resource package is not initialized")
                 .WithPackage(name));
     }
+    if (play_mode == PlayMode::EditorSimulate) {
+        return MakeFailedHandle(AssetInfo{}, LoadMethod::BundleFile,
+                                MakeError(ErrorCode::Unsupported,
+                                          "bundle files are not available in EditorSimulate mode")
+                                    .WithPackage(name));
+    }
     const auto* bundle = FindBundle(location);
     if (bundle == nullptr) {
         return MakeFailedHandle(AssetInfo{}, LoadMethod::BundleFile,
@@ -1201,6 +1611,145 @@ AssetHandle ResourcePackageImpl::LoadBundleFile(const core::AssetGuid& guid) {
                                     .WithBundle(guid.ToHex()));
     }
     return LoadBundleFile(bundle->bundle_name);
+}
+
+Result<std::shared_ptr<RawFileReader>> ResourcePackageImpl::OpenRawFile(std::string_view location) {
+    if (!initialized || destroyed) {
+        return MakeError(ErrorCode::InvalidArgument, "resource package is not initialized")
+            .WithPackage(name);
+    }
+    if (loaded_lock()) {
+        return MakeError(ErrorCode::Canceled, "resource package is being unloaded")
+            .WithPackage(name);
+    }
+
+    auto resolved = ResolveAsset(location);
+    if (!resolved) {
+        return std::move(resolved).TakeError();
+    }
+    const auto& asset = *resolved.Value();
+
+    if (play_mode == PlayMode::EditorSimulate ||
+        (asset.flags & serialize::kManifestAssetFlagArchiveRaw) == 0) {
+        AssetHandle handle = Load(location, LoadMethod::RawFile, assets::kInvalidTypeId, false, 0);
+        if (!handle.IsValid()) {
+            return MakeError(ErrorCode::NotFound, "raw asset could not be loaded")
+                .WithPackage(name)
+                .WithAsset(std::string(location));
+        }
+        if (!handle.IsDone()) {
+            auto waited = handle.WaitForCompletion();
+            if (!waited) {
+                core::Error error = std::move(waited).TakeError();
+                handle.Release();
+                return error;
+            }
+        }
+        if (handle.Status() != core::OperationStatus::Succeeded) {
+            core::Error error = handle.LastError();
+            handle.Release();
+            return error;
+        }
+        const auto data = handle.Data();
+        auto memory = std::make_shared<std::vector<std::byte>>(data.begin(), data.end());
+        handle.Release();
+
+        auto impl = std::make_shared<RawFileReaderImpl>();
+        impl->package = shared_from_this();
+        impl->memory = std::move(memory);
+        impl->size = static_cast<std::uint64_t>(impl->memory->size());
+        return std::shared_ptr<RawFileReader>(new RawFileReader(std::move(impl)));
+    }
+
+    ManifestPtr active;
+    {
+        std::lock_guard lock(mutex);
+        active = manifest;
+    }
+    if (!active) {
+        return MakeError(ErrorCode::InvalidArgument, "package manifest is not loaded")
+            .WithPackage(name);
+    }
+    if (asset.bundle_index >= active->Bundles().size()) {
+        return MakeError(ErrorCode::Corrupt, "asset bundle index is out of range")
+            .WithPackage(name)
+            .WithAsset(std::string(location));
+    }
+
+    const auto bundle_index = static_cast<std::uint32_t>(asset.bundle_index);
+    core::Error acquire_error;
+    auto loader = AcquireBundle(active, bundle_index, acquire_error);
+    if (!loader) {
+        return acquire_error;
+    }
+
+    const auto fail = [&](core::Error error) -> Result<std::shared_ptr<RawFileReader>> {
+        ReleaseBundle(loader);
+        return std::move(error);
+    };
+
+    const auto load_bundle = [&]() -> Result<void> {
+        auto downloadable = EnsureBundleDownloaded(active, bundle_index);
+        if (!downloadable) {
+            return std::move(downloadable).TakeError();
+        }
+        if (!AcquireBundleSlot()) {
+            return MakeError(ErrorCode::Canceled, "package stopped while loading bundles")
+                .WithPackage(name);
+        }
+        auto loaded = loader->Load();
+        ReleaseBundleSlot();
+        return loaded;
+    };
+
+    auto loaded = load_bundle();
+    if (!loaded) {
+        const auto code = loaded.GetError().code;
+        const bool recoverable = code == ErrorCode::HashMismatch || code == ErrorCode::Corrupt ||
+                                 code == ErrorCode::NotFound;
+        if (recoverable) {
+            auto repaired = EnsureBundleDownloaded(active, bundle_index);
+            if (repaired) {
+                loaded = load_bundle();
+            }
+        }
+    }
+    if (!loaded) {
+        return fail(std::move(loaded).TakeError());
+    }
+
+    const serialize::BundleToc* toc = loader->Toc();
+    if (toc == nullptr) {
+        return fail(MakeError(ErrorCode::Corrupt, "archive bundle has no TOC")
+                        .WithPackage(name)
+                        .WithAsset(std::string(location)));
+    }
+    const serialize::BundleRawFileDesc* raw_file = nullptr;
+    for (const auto& raw : toc->raw_files) {
+        if (raw.name == asset.asset_path) {
+            raw_file = &raw;
+            break;
+        }
+    }
+    if (raw_file == nullptr) {
+        return fail(MakeError(ErrorCode::NotFound, "archive raw file was not found")
+                        .WithPackage(name)
+                        .WithAsset(std::string(location))
+                        .WithPath(std::string(asset.asset_path)));
+    }
+
+    auto impl = std::make_shared<RawFileReaderImpl>();
+    impl->package = shared_from_this();
+    impl->bundle = loader;
+    impl->raw_name.assign(asset.asset_path);
+    impl->size = raw_file->size;
+    return std::shared_ptr<RawFileReader>(new RawFileReader(std::move(impl)));
+}
+
+RawFileReaderImpl::~RawFileReaderImpl() {
+    if (bundle && package) {
+        package->ReleaseBundle(bundle);
+    }
 }
 
 std::size_t ResourcePackageImpl::UnloadAll() noexcept {
@@ -1451,6 +2000,10 @@ std::string_view ResourcePackage::Name() const noexcept {
     return impl_ ? std::string_view(impl_->name) : std::string_view(empty);
 }
 
+PlayMode ResourcePackage::GetPlayMode() const noexcept {
+    return impl_ ? impl_->GetPlayMode() : PlayMode::Auto;
+}
+
 std::string_view ResourcePackage::Version() const noexcept {
     static const std::string empty;
     return impl_ ? std::string_view(impl_->version) : std::string_view(empty);
@@ -1469,7 +2022,29 @@ std::shared_ptr<FileSystemHost> ResourcePackage::Host() const noexcept {
 }
 
 Result<void> ResourcePackage::ReloadManifest() {
-    if (!impl_ || !impl_->host) {
+    if (!impl_ || !impl_->initialized || impl_->destroyed) {
+        return MakeError(ErrorCode::InvalidArgument, "resource package is not initialized");
+    }
+    if (impl_->play_mode == PlayMode::EditorSimulate) {
+        if (impl_->simulate_manifest_path.empty()) {
+            return MakeError(ErrorCode::InvalidArgument,
+                             "EditorSimulate manifest path is not configured")
+                .WithPackage(impl_->name);
+        }
+        auto loaded = serialize::LoadManifestFile(impl_->simulate_manifest_path, true);
+        if (!loaded) {
+            return std::move(loaded).TakeError();
+        }
+        std::lock_guard lock(impl_->mutex);
+        impl_->manifest = MakeManifestPtr(std::move(loaded).Value());
+        ++impl_->generation;
+        impl_->version.assign(impl_->manifest->PackageVersion());
+        if (impl_->name.empty()) {
+            impl_->name.assign(impl_->manifest->PackageName());
+        }
+        return {};
+    }
+    if (!impl_->host) {
         return MakeError(ErrorCode::InvalidArgument, "resource package is not initialized");
     }
     auto loaded = impl_->host->LoadManifest();
@@ -1526,7 +2101,14 @@ Result<void> ResourcePackage::LoadManifest(ManifestPtr manifest) {
 }
 
 Result<void> ResourcePackage::EnsureBundle(std::string_view bundle_name) {
-    if (!impl_ || !impl_->host) {
+    if (!impl_) {
+        return MakeError(ErrorCode::InvalidArgument, "resource package is not initialized");
+    }
+    if (impl_->play_mode == PlayMode::EditorSimulate) {
+        return MakeError(ErrorCode::Unsupported, "bundles are not available in EditorSimulate mode")
+            .WithPackage(impl_->name);
+    }
+    if (!impl_->host) {
         return MakeError(ErrorCode::InvalidArgument, "resource package is not initialized");
     }
     const auto* bundle = impl_->FindBundle(bundle_name);
@@ -1556,7 +2138,14 @@ Result<void> ResourcePackage::EnsureBundle(std::string_view bundle_name) {
 }
 
 Result<void> ResourcePackage::EnsureBundle(const core::AssetGuid& bundle_guid) {
-    if (!impl_ || !impl_->manifest) {
+    if (!impl_) {
+        return MakeError(ErrorCode::InvalidArgument, "resource package is not initialized");
+    }
+    if (impl_->play_mode == PlayMode::EditorSimulate) {
+        return MakeError(ErrorCode::Unsupported, "bundles are not available in EditorSimulate mode")
+            .WithPackage(impl_->name);
+    }
+    if (!impl_->manifest) {
         return MakeError(ErrorCode::InvalidArgument, "resource package is not initialized");
     }
     ManifestPtr manifest;
@@ -1638,6 +2227,43 @@ AssetHandle ResourcePackage::LoadRawFileAsync(std::string_view location, int pri
         return AssetHandle{};
     }
     return impl_->Load(location, LoadMethod::RawFile, assets::kInvalidTypeId, true, priority);
+}
+
+Result<std::shared_ptr<RawFileReader>> ResourcePackage::OpenRawFile(std::string_view location) {
+    if (!impl_) {
+        return MakeError(ErrorCode::InvalidArgument, "resource package implementation is null");
+    }
+    return impl_->OpenRawFile(location);
+}
+
+RawFileReader::RawFileReader(std::shared_ptr<RawFileReaderImpl> impl) noexcept
+    : impl_(std::move(impl)) {}
+
+RawFileReader::~RawFileReader() = default;
+
+std::uint64_t RawFileReader::Size() const noexcept { return impl_ ? impl_->size : 0; }
+
+Result<std::vector<std::byte>> RawFileReader::Read(std::uint64_t offset, std::uint64_t size) const {
+    if (!impl_) {
+        return MakeError(ErrorCode::InvalidArgument, "raw file reader is not initialized");
+    }
+    if (offset > impl_->size || size > impl_->size - offset) {
+        return MakeError(ErrorCode::InvalidArgument, "raw file range is out of bounds");
+    }
+    if (size == 0) {
+        return std::vector<std::byte>{};
+    }
+    if (size > std::numeric_limits<std::size_t>::max()) {
+        return MakeError(ErrorCode::InvalidArgument, "raw file range is too large");
+    }
+    if (impl_->memory) {
+        const auto begin = impl_->memory->begin() + static_cast<std::size_t>(offset);
+        return std::vector<std::byte>(begin, begin + static_cast<std::size_t>(size));
+    }
+    if (!impl_->bundle) {
+        return MakeError(ErrorCode::InvalidArgument, "raw file reader has no bundle");
+    }
+    return impl_->bundle->ReadRawFileRange(impl_->raw_name, offset, size);
 }
 
 AssetHandle ResourcePackage::LoadBundleFile(std::string_view bundle_name) {
@@ -1903,7 +2529,14 @@ bool ResourcePackage::TryUnloadUnusedAsset(std::string_view location) {
 }
 
 Result<void> ResourcePackage::ClearCache(const CacheClearOptions& options) {
-    if (!impl_ || !impl_->host) {
+    if (!impl_) {
+        return MakeError(ErrorCode::InvalidArgument, "resource package is not initialized");
+    }
+    if (impl_->play_mode == PlayMode::EditorSimulate) {
+        return MakeError(ErrorCode::Unsupported, "cache is not available in EditorSimulate mode")
+            .WithPackage(impl_->name);
+    }
+    if (!impl_->host) {
         return MakeError(ErrorCode::InvalidArgument, "resource package is not initialized");
     }
     CacheClearOptions resolved = options;
@@ -1983,7 +2616,15 @@ Result<void> ResourcePackage::ClearCache(const CacheClearOptions& options) {
 }
 
 Result<CacheVerifyReport> ResourcePackage::VerifyCacheFiles(const CacheVerifyOptions& options) {
-    if (!impl_ || !impl_->host) {
+    if (!impl_) {
+        return MakeError(ErrorCode::InvalidArgument, "resource package is not initialized");
+    }
+    if (impl_->play_mode == PlayMode::EditorSimulate) {
+        return MakeError(ErrorCode::Unsupported,
+                         "cache verification is not available in EditorSimulate mode")
+            .WithPackage(impl_->name);
+    }
+    if (!impl_->host) {
         return MakeError(ErrorCode::InvalidArgument, "resource package is not initialized");
     }
     ManifestPtr manifest;
@@ -2007,8 +2648,7 @@ Result<CacheVerifyReport> ResourcePackage::VerifyCacheFiles(const CacheVerifyOpt
         std::clamp<std::size_t>(options.max_concurrency, std::size_t{1}, std::size_t{32});
     const std::size_t hardware = std::thread::hardware_concurrency();
     const std::size_t hardware_cap = hardware == 0 ? 1U : hardware * 2U + 1U;
-    const std::size_t worker_count =
-        std::min({configured_workers, hardware_cap, report.total});
+    const std::size_t worker_count = std::min({configured_workers, hardware_cap, report.total});
     auto verify_one = [&](std::size_t index) {
         auto status = host->VerifyCachedBundle(bundles[index], options.level);
         if (!status) {
@@ -2052,24 +2692,24 @@ Result<CacheVerifyReport> ResourcePackage::VerifyCacheFiles(const CacheVerifyOpt
         }
         const auto& bundle = bundles[i];
         switch (statuses[i]) {
-            case CacheVerifyStatus::Valid:
-                ++report.valid;
-                report.valid_bytes += bundle.file_size;
-                break;
-            case CacheVerifyStatus::Missing:
-                ++report.missing;
-                break;
-            case CacheVerifyStatus::Corrupt:
-                ++report.invalid;
-                if (host->InvalidateBundle(bundle)) {
-                    ++report.removed;
-                } else {
-                    ++report.failed;
-                }
-                break;
-            case CacheVerifyStatus::Unsupported:
-                ++report.unsupported;
-                break;
+        case CacheVerifyStatus::Valid:
+            ++report.valid;
+            report.valid_bytes += bundle.file_size;
+            break;
+        case CacheVerifyStatus::Missing:
+            ++report.missing;
+            break;
+        case CacheVerifyStatus::Corrupt:
+            ++report.invalid;
+            if (host->InvalidateBundle(bundle)) {
+                ++report.removed;
+            } else {
+                ++report.failed;
+            }
+            break;
+        case CacheVerifyStatus::Unsupported:
+            ++report.unsupported;
+            break;
         }
     }
     return report;
@@ -2088,9 +2728,15 @@ Result<void> ResourcePackage::VerifyCache() {
     return {};
 }
 
-
 Result<CacheStats> ResourcePackage::QueryCache() const {
-    if (!impl_ || !impl_->host) {
+    if (!impl_) {
+        return MakeError(ErrorCode::InvalidArgument, "resource package is not initialized");
+    }
+    if (impl_->play_mode == PlayMode::EditorSimulate) {
+        return MakeError(ErrorCode::Unsupported, "cache is not available in EditorSimulate mode")
+            .WithPackage(impl_->name);
+    }
+    if (!impl_->host) {
         return MakeError(ErrorCode::InvalidArgument, "resource package is not initialized");
     }
     return impl_->host->QueryCache();
@@ -2099,7 +2745,15 @@ Result<CacheStats> ResourcePackage::QueryCache() const {
 Result<std::shared_ptr<ResourceDownloader>>
 ResourcePackage::CreateDownloader(std::span<const std::string> locations,
                                   std::span<const std::string> tags) {
-    if (!impl_ || !impl_->host) {
+    if (!impl_) {
+        return MakeError(ErrorCode::InvalidArgument, "resource package is not initialized");
+    }
+    if (impl_->play_mode == PlayMode::EditorSimulate) {
+        return MakeError(ErrorCode::Unsupported,
+                         "downloader is not available in EditorSimulate mode")
+            .WithPackage(impl_->name);
+    }
+    if (!impl_->host) {
         return MakeError(ErrorCode::InvalidArgument, "resource package is not initialized");
     }
     if (!impl_->options.download_transport || !impl_->options.download_url_provider) {
@@ -2184,14 +2838,58 @@ ResourcePackage::CreateDownloader(std::span<const std::string> locations,
         impl_->options.download_url_provider, impl_->options.download_options);
 }
 
-Result<std::shared_ptr<ResourceUnpacker>> ResourcePackage::CreateUnpacker() {
-    return MakeError(ErrorCode::Unsupported, "unpacker is not available in R05")
-        .WithPackage(impl_ ? impl_->name : std::string{});
+Result<std::shared_ptr<ResourceUnpacker>>
+ResourcePackage::CreateUnpacker(const UnpackOptions& options) {
+    if (!impl_) {
+        return MakeError(ErrorCode::InvalidArgument, "resource package is not initialized");
+    }
+    if (impl_->play_mode == PlayMode::EditorSimulate) {
+        return MakeError(ErrorCode::Unsupported, "unpacker is not available in EditorSimulate mode")
+            .WithPackage(impl_->name);
+    }
+    if (!impl_->host) {
+        return MakeError(ErrorCode::InvalidArgument, "resource package is not initialized")
+            .WithPackage(impl_->name);
+    }
+    ManifestPtr manifest;
+    std::shared_ptr<FileSystemHost> host;
+    {
+        std::lock_guard lock(impl_->mutex);
+        manifest = impl_->manifest;
+        host = impl_->host;
+    }
+    if (!manifest || !host) {
+        return MakeError(ErrorCode::InvalidArgument, "package manifest is not loaded")
+            .WithPackage(impl_->name);
+    }
+    return MakeBundleUnpacker(impl_->name, std::move(manifest), std::move(host), options);
 }
 
-Result<std::shared_ptr<ResourceImporter>> ResourcePackage::CreateImporter() {
-    return MakeError(ErrorCode::Unsupported, "importer is not available in R05")
-        .WithPackage(impl_ ? impl_->name : std::string{});
+Result<std::shared_ptr<ResourceImporter>>
+ResourcePackage::CreateImporter(const BundleImportOptions& options) {
+    if (!impl_) {
+        return MakeError(ErrorCode::InvalidArgument, "resource package is not initialized");
+    }
+    if (impl_->play_mode == PlayMode::EditorSimulate) {
+        return MakeError(ErrorCode::Unsupported, "importer is not available in EditorSimulate mode")
+            .WithPackage(impl_->name);
+    }
+    if (!impl_->host) {
+        return MakeError(ErrorCode::InvalidArgument, "resource package is not initialized")
+            .WithPackage(impl_->name);
+    }
+    ManifestPtr manifest;
+    std::shared_ptr<FileSystemHost> host;
+    {
+        std::lock_guard lock(impl_->mutex);
+        manifest = impl_->manifest;
+        host = impl_->host;
+    }
+    if (!manifest || !host) {
+        return MakeError(ErrorCode::InvalidArgument, "package manifest is not loaded")
+            .WithPackage(impl_->name);
+    }
+    return MakeBundleImporter(impl_->name, std::move(manifest), std::move(host), options);
 }
 
 Result<void> ResourcePackage::StartOperation(core::OperationPtr operation) {
@@ -2290,7 +2988,3 @@ void LoadingLock::Release() noexcept {
 }
 
 } // namespace parcel::runtime
-
-
-
-

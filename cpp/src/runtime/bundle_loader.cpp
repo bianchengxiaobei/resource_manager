@@ -1,4 +1,4 @@
-﻿#include "parcel/runtime/bundle_loader.hpp"
+#include "parcel/runtime/bundle_loader.hpp"
 
 #include "parcel/assets/asset_codec.hpp"
 #include "parcel/core/hash.hpp"
@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <limits>
 #include <mutex>
 #include <utility>
 
@@ -17,91 +18,6 @@ namespace {
 using core::ErrorCode;
 using core::MakeError;
 using core::Result;
-
-class AssetReadContext final : public assets::IAssetReadContext {
-  public:
-    AssetReadContext(const serialize::AssetFileReader& reader, assets::IObjectResolver* resolver)
-        : reader_(reader), resolver_(resolver) {}
-
-    Result<std::span<const std::byte>> Blob(std::uint64_t id) const override {
-        const auto blobs = reader_.Blobs();
-        if (id >= blobs.size()) {
-            return MakeError(ErrorCode::Corrupt, "asset blob id is out of range");
-        }
-        return blobs[static_cast<std::size_t>(id)].data;
-    }
-
-    Result<std::shared_ptr<assets::AssetObject>> Resolve(core::AssetGuid guid) override {
-        if (resolver_ == nullptr) {
-            return MakeError(ErrorCode::NotFound, "no object resolver is available");
-        }
-        return resolver_->Resolve(guid);
-    }
-
-  private:
-    const serialize::AssetFileReader& reader_;
-    assets::IObjectResolver* resolver_ = nullptr;
-};
-
-struct DecodedAssets {
-    std::vector<std::shared_ptr<assets::AssetObject>> objects;
-    std::vector<std::uint32_t> local_ids;
-    std::vector<std::uint32_t> sub_asset_ids;
-};
-
-Result<DecodedAssets> DecodeAssets(std::span<const std::byte> data,
-                                   const assets::TypeRegistry& registry,
-                                   assets::IObjectResolver* resolver) {
-    auto opened = serialize::AssetFileReader::Open(data, true);
-    if (!opened) {
-        return std::move(opened).TakeError();
-    }
-    serialize::AssetFileReader reader = std::move(opened).Value();
-    PARCEL_TRY(reader.ReadAll(true));
-    if (reader.Objects().empty()) {
-        return MakeError(ErrorCode::Corrupt, "asset file has no objects");
-    }
-
-    DecodedAssets decoded;
-    decoded.objects.reserve(reader.Objects().size());
-    decoded.local_ids.reserve(reader.Objects().size());
-    AssetReadContext context(reader, resolver);
-    for (const auto& object : reader.Objects()) {
-        const assets::ITypeSerializer* serializer = registry.Find(object.type_id);
-        if (serializer == nullptr) {
-            return MakeError(ErrorCode::Unsupported, "unknown asset type id");
-        }
-        bool declared = false;
-        for (const auto& type : reader.Types()) {
-            if (type.type_id == object.type_id &&
-                type.serializer_version == serializer->Version()) {
-                declared = true;
-                break;
-            }
-        }
-        if (!declared) {
-            return MakeError(ErrorCode::Unsupported, "unsupported asset serializer version");
-        }
-        serialize::BinaryReader metadata(object.metadata);
-        auto asset = serializer->Deserialize(metadata, context);
-        if (!asset) {
-            return std::move(asset).TakeError();
-        }
-        if (!metadata.IsAtEnd()) {
-            return MakeError(ErrorCode::Corrupt, "asset metadata has trailing bytes");
-        }
-        if (asset.Value()->Type() != object.type_id) {
-            return MakeError(ErrorCode::Corrupt, "asset object type does not match its serializer");
-        }
-        decoded.objects.push_back(std::move(asset).Value());
-        decoded.local_ids.push_back(object.local_id);
-    }
-    decoded.sub_asset_ids.reserve(reader.SubAssets().size());
-    for (const auto& sub_asset : reader.SubAssets()) {
-        decoded.sub_asset_ids.push_back(sub_asset.local_object_id);
-    }
-    return decoded;
-}
 
 } // namespace
 
@@ -304,6 +220,30 @@ Result<std::vector<std::byte>> BundleLoader::ReadRawFile(std::string_view name) 
         .WithPath(std::string(name));
 }
 
+Result<std::vector<std::byte>>
+BundleLoader::ReadRawFileRange(std::string_view name, std::uint64_t offset, std::uint64_t size) {
+    std::lock_guard lock(impl_->mutex);
+    if (!impl_->reader || !impl_->loaded) {
+        return MakeError(ErrorCode::NotFound, "bundle is not loaded")
+            .WithBundle(std::string(impl_->info.bundle_name));
+    }
+    for (const auto& raw : impl_->reader->Toc().raw_files) {
+        if (raw.name != name) {
+            continue;
+        }
+        if (offset > raw.size || size > raw.size - offset ||
+            offset > std::numeric_limits<std::uint64_t>::max() - raw.logical_offset) {
+            return MakeError(ErrorCode::InvalidArgument, "raw file range is out of bounds")
+                .WithBundle(std::string(impl_->info.bundle_name))
+                .WithPath(std::string(name));
+        }
+        return impl_->reader->ReadLogical(raw.logical_offset + offset, size);
+    }
+    return MakeError(ErrorCode::NotFound, "raw file was not found in the bundle")
+        .WithBundle(std::string(impl_->info.bundle_name))
+        .WithPath(std::string(name));
+}
+
 BundleHandle::BundleHandle(std::shared_ptr<BundleLoader> loader,
                            const assets::TypeRegistry* registry, assets::IObjectResolver* resolver,
                            std::uint32_t payload_id, std::uint32_t local_object_id)
@@ -318,7 +258,7 @@ Result<std::shared_ptr<assets::AssetObject>> BundleHandle::LoadAsset() {
     if (!bytes) {
         return std::move(bytes).TakeError();
     }
-    auto decoded = DecodeAssets(bytes.Value(), *registry_, resolver_);
+    auto decoded = assets::DecodeAssetFileBytes(bytes.Value(), *registry_, resolver_);
     if (!decoded) {
         return std::move(decoded).TakeError();
     }
@@ -338,7 +278,7 @@ Result<std::vector<std::shared_ptr<assets::AssetObject>>> BundleHandle::LoadAllA
     if (!bytes) {
         return std::move(bytes).TakeError();
     }
-    auto decoded = DecodeAssets(bytes.Value(), *registry_, resolver_);
+    auto decoded = assets::DecodeAssetFileBytes(bytes.Value(), *registry_, resolver_);
     if (!decoded) {
         return std::move(decoded).TakeError();
     }
@@ -353,7 +293,7 @@ Result<std::vector<std::shared_ptr<assets::AssetObject>>> BundleHandle::LoadSubA
     if (!bytes) {
         return std::move(bytes).TakeError();
     }
-    auto decoded = DecodeAssets(bytes.Value(), *registry_, resolver_);
+    auto decoded = assets::DecodeAssetFileBytes(bytes.Value(), *registry_, resolver_);
     if (!decoded) {
         return std::move(decoded).TakeError();
     }
@@ -381,4 +321,3 @@ void BundleHandle::Unload() noexcept { loader_.reset(); }
 std::shared_ptr<BundleLoader> BundleHandle::Loader() const noexcept { return loader_; }
 
 } // namespace parcel::runtime
-

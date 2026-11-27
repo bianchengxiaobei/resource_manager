@@ -415,11 +415,16 @@ if(PARCEL_HBG_ROOT AND PARCEL_HBG_BGFX_INCLUDE_DIR AND TARGET parcel_entt AND
    EXISTS "${PARCEL_HBG_ROOT}/src/render/scene/render_scene.h")
     add_library(parcel_hbg STATIC
         src/hbg/asset_materializer.cpp
+        src/hbg/heightmap_tile_cache.cpp
         src/hbg/material_mapping.cpp
         src/hbg/parcel_material_system.cpp
+        src/hbg/river.cpp
         src/hbg/scene_render_bridge.cpp
         src/hbg/settings_bridge.cpp
         src/hbg/shader_library_bootstrap.cpp
+        src/hbg/terrain_lod.cpp
+        src/hbg/vegetation.cpp
+        src/hbg/water_surface.cpp
     )
     add_library(parcel::hbg ALIAS parcel_hbg)
 
@@ -455,6 +460,38 @@ if(PARCEL_HBG_ROOT AND PARCEL_HBG_BGFX_INCLUDE_DIR AND TARGET parcel_entt AND
     message(STATUS "Parcel: hdrp-bgfx adapter enabled at ${PARCEL_HBG_ROOT}")
 else()
     message(STATUS "Parcel: hdrp-bgfx adapter disabled (set PARCEL_HBG_ROOT and PARCEL_HBG_BGFX_INCLUDE_DIR)")
+endif()
+
+option(PARCEL_BUILD_HBG_GPU_SMOKE "Build the Parcel -> hdrp-bgfx GPU smoke executable" OFF)
+if(PARCEL_BUILD_HBG_GPU_SMOKE)
+    if(WIN32 AND TARGET parcel_hbg AND TARGET hbg_app AND TARGET glfw)
+        add_executable(parcel_hbg_gpu_smoke
+            tools/hbg_gpu_smoke.cpp
+        )
+        target_link_libraries(parcel_hbg_gpu_smoke
+            PRIVATE
+                parcel_hbg
+                hbg_app
+                glfw
+        )
+        target_compile_features(parcel_hbg_gpu_smoke PRIVATE cxx_std_20)
+        parcel_set_warnings(parcel_hbg_gpu_smoke)
+        set_target_properties(parcel_hbg_gpu_smoke PROPERTIES
+            VS_DEBUGGER_WORKING_DIRECTORY "${PARCEL_HBG_ROOT}"
+        )
+        if(PARCEL_BUILD_TESTS)
+            add_test(NAME parcel_hbg_gpu_smoke
+                COMMAND parcel_hbg_gpu_smoke --frames=2 --width=160 --height=120
+            )
+            set_tests_properties(parcel_hbg_gpu_smoke PROPERTIES
+                TIMEOUT 180
+                RUN_SERIAL TRUE
+            )
+        endif()
+        message(STATUS "Parcel: hbg GPU smoke enabled")
+    else()
+        message(WARNING "Parcel: PARCEL_BUILD_HBG_GPU_SMOKE requires Windows, parcel_hbg, hbg_app and glfw; target skipped")
+    endif()
 endif()
 
 find_package(Threads REQUIRED)
@@ -563,6 +600,7 @@ endif()
 
 add_library(parcel_pack STATIC
     src/pack/pack.cpp
+    src/pack/toml_config.cpp
 )
 
 add_library(parcel::pack ALIAS parcel_pack)
@@ -642,6 +680,7 @@ endif()
 add_library(parcel_runtime STATIC
     src/runtime/asset_system.cpp
     src/runtime/bundle_loader.cpp
+    src/runtime/bundle_transfer.cpp
     src/runtime/downloader.cpp
     src/runtime/file_system.cpp
     src/runtime/handle.cpp

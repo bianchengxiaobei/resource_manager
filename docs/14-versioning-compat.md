@@ -46,6 +46,8 @@
   `auth`、`gray`、`rollback`；新增 `force_update` 等字段可忽略。
 - Manifest hash 统一为 PRCM 160 字节头后 payload 的 SHA-256；客户端接受带/不带
   `sha256:` 前缀。
+- Archive bundle 使用 Manifest asset flags bit 0 `ArchiveRaw` 和 PRCL `raw_files`；
+  旧版 Runtime 不能读取 archive raw，需使用配套 Runtime。非 archive 包保持兼容。
 - 文件路径约定为 `/files/<package>/<version>/...`；CDN 根地址可替换。
 - 签名 URL 变更参数名或 canonical 字符串属于不兼容变更，必须升 API 版本。
 

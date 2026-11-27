@@ -1,6 +1,7 @@
 ﻿#pragma once
 
 #include "parcel/core/error.hpp"
+#include "parcel/core/guid.hpp"
 #include "parcel/core/result.hpp"
 #include "parcel/serialize/manifest.hpp"
 
@@ -134,5 +135,20 @@ struct DownloadOptions {
     std::function<void(const DownloadEvent&)> on_event;
 };
 
-} // namespace parcel::runtime
+struct UnpackOptions {
+    std::vector<std::string> tags;
+    int max_concurrency = 4;
+};
 
+struct BundleImportInfo {
+    std::string file_path;
+    std::string bundle_name;
+    core::AssetGuid bundle_guid;
+};
+
+struct BundleImportOptions {
+    std::vector<BundleImportInfo> bundles;
+    int max_concurrency = 4;
+};
+
+} // namespace parcel::runtime

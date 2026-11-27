@@ -19,6 +19,7 @@
 #include "test_util.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -27,6 +28,8 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -58,6 +61,37 @@ parcel::assets::TextureAsset MakeTexture(std::uint32_t width, std::uint32_t heig
         mip.data[index] = static_cast<std::byte>(index & 0xff);
     }
     texture.mips.push_back(std::move(mip));
+    return texture;
+}
+
+parcel::assets::TextureAsset MakeMippedTexture(std::uint32_t width, std::uint32_t height,
+                                               std::uint32_t mip_count) {
+    parcel::assets::TextureAsset texture;
+    texture.format = parcel::assets::TextureFormat::RGBA8;
+    texture.sRGB = true;
+    texture.mip_count = mip_count;
+    for (std::uint32_t level = 0; level < mip_count; ++level) {
+        const std::uint32_t shift = std::min(level, 31U);
+        const std::uint32_t mip_width = std::max(1U, width >> shift);
+        const std::uint32_t mip_height = std::max(1U, height >> shift);
+        parcel::assets::TextureMip mip;
+        mip.width = mip_width;
+        mip.height = mip_height;
+        mip.row_pitch = mip_width * 4;
+        mip.data.resize(static_cast<std::size_t>(mip_width) * mip_height * 4);
+        for (std::uint32_t y = 0; y < mip_height; ++y) {
+            for (std::uint32_t x = 0; x < mip_width; ++x) {
+                const bool light = ((x / 2U) + (y / 2U) + level) % 2U == 0U;
+                const std::size_t offset = (static_cast<std::size_t>(y) * mip_width + x) * 4;
+                const std::uint8_t value = light ? 224 : 32;
+                mip.data[offset] = static_cast<std::byte>(value);
+                mip.data[offset + 1] = static_cast<std::byte>(value);
+                mip.data[offset + 2] = static_cast<std::byte>(value);
+                mip.data[offset + 3] = std::byte{0xff};
+            }
+        }
+        texture.mips.push_back(std::move(mip));
+    }
     return texture;
 }
 
@@ -404,7 +438,8 @@ TEST_CASE("hbg scene render bridge builds render scene from entt components") {
     auto material = std::make_shared<parcel::assets::MaterialAsset>(MakeMaterial(texture_guid));
     material->normal_texture.texture = {};
     assets.emplace(material_guid, material);
-    assets.emplace(texture_guid, std::make_shared<parcel::assets::TextureAsset>(MakeTexture(1, 1)));
+    assets.emplace(texture_guid,
+                   std::make_shared<parcel::assets::TextureAsset>(MakeMippedTexture(4, 4, 2)));
 
     auto resolve =
         [&](AssetGuid guid) -> parcel::core::Result<std::shared_ptr<parcel::assets::AssetObject>> {
@@ -422,7 +457,9 @@ TEST_CASE("hbg scene render bridge builds render scene from entt components") {
     CHECK_FALSE(bridge.dirty());
     CHECK(render_scene.meshes.size() == 1);
     CHECK(render_scene.materials.size() == 1);
-    CHECK(render_scene.images.size() == 1);
+    REQUIRE(render_scene.images.size() == 1);
+    CHECK(render_scene.images.front().mipCount == 2);
+    CHECK(render_scene.images.front().pixels.size() == 80);
     CHECK(render_scene.objects.size() == 1);
     CHECK(render_scene.cameras.size() == 1);
     CHECK(render_scene.lights.size() == 1);
@@ -466,6 +503,95 @@ TEST_CASE("hbg scene render bridge builds render scene from entt components") {
     auto rebuilt = bridge.UpdateIfDirty(registry, render_scene);
     REQUIRE(rebuilt);
     CHECK(render_scene.objects.size() == 1);
+
+    REQUIRE(loader.Destroy(instance.Value()));
+}
+
+TEST_CASE("hbg scene render bridge deduplicates shared static meshes and materials") {
+    const AssetGuid mesh_guid = Guid('a');
+    const AssetGuid morph_mesh_guid = Guid('e');
+    const AssetGuid material_guid = Guid('b');
+    const AssetGuid material_guid_2 = Guid('f');
+    const AssetGuid texture_guid = Guid('c');
+
+    parcel::scene::SceneData scene_data;
+    for (std::uint64_t id = 1; id <= 6; ++id) {
+        AddEntity(scene_data, id, 0, "Object" + std::to_string(id));
+        parcel::scene::TransformComponent transform;
+        transform.position = {static_cast<float>(id), 0.0f, 0.0f};
+        AddComponent(scene_data, {id}, transform);
+
+        parcel::scene::MeshRendererComponent renderer;
+        renderer.mesh = id <= 4 ? mesh_guid : morph_mesh_guid;
+        renderer.materials = {id == 4 ? material_guid_2 : material_guid};
+        AddComponent(scene_data, {id}, renderer);
+    }
+
+    ::entt::registry registry;
+    parcel_entt::EnttSceneLoader loader;
+    auto instance = loader.Instantiate(scene_data, &registry);
+    REQUIRE(instance);
+
+    std::unordered_map<AssetGuid, std::shared_ptr<parcel::assets::AssetObject>,
+                       parcel::core::Guid128Hash>
+        assets;
+    assets.emplace(mesh_guid, std::make_shared<parcel::assets::MeshAsset>(MakeMesh()));
+    assets.emplace(morph_mesh_guid, std::make_shared<parcel::assets::MeshAsset>(MakeMorphMesh()));
+    auto material = std::make_shared<parcel::assets::MaterialAsset>(MakeMaterial(texture_guid));
+    material->normal_texture.texture = {};
+    assets.emplace(material_guid, material);
+    auto material_2 = std::make_shared<parcel::assets::MaterialAsset>(*material);
+    material_2->base_color_factor = {0.8f, 0.6f, 0.2f, 1.0f};
+    assets.emplace(material_guid_2, material_2);
+    assets.emplace(texture_guid,
+                   std::make_shared<parcel::assets::TextureAsset>(MakeMippedTexture(4, 4, 2)));
+
+    auto resolve =
+        [&](AssetGuid guid) -> parcel::core::Result<std::shared_ptr<parcel::assets::AssetObject>> {
+        const auto found = assets.find(guid);
+        if (found == assets.end()) {
+            return parcel::core::MakeError(ErrorCode::NotFound, "missing asset");
+        }
+        return found->second;
+    };
+
+    parcel_hbg::SceneRenderBridge bridge(resolve);
+    hbg::render::RenderScene render_scene;
+    auto updated = bridge.Update(registry, render_scene);
+    REQUIRE(updated);
+    REQUIRE(render_scene.objects.size() == 6);
+    CHECK(render_scene.materials.size() == 2);
+    CHECK(render_scene.images.size() == 1);
+    CHECK(render_scene.meshes.size() == 4);
+
+    auto object_named = [&](std::string_view name) -> const hbg::render::RenderObject* {
+        for (const hbg::render::RenderObject& object : render_scene.objects) {
+            if (object.name == name) {
+                return &object;
+            }
+        }
+        return nullptr;
+    };
+    const auto* first = object_named("Object1");
+    const auto* second = object_named("Object2");
+    const auto* third = object_named("Object3");
+    const auto* other_material = object_named("Object4");
+    const auto* morph_first = object_named("Object5");
+    const auto* morph_second = object_named("Object6");
+    REQUIRE(first != nullptr);
+    REQUIRE(second != nullptr);
+    REQUIRE(third != nullptr);
+    REQUIRE(other_material != nullptr);
+    REQUIRE(morph_first != nullptr);
+    REQUIRE(morph_second != nullptr);
+    CHECK(first->meshIndex == second->meshIndex);
+    CHECK(first->meshIndex == third->meshIndex);
+    CHECK(first->meshIndex != other_material->meshIndex);
+    CHECK(morph_first->meshIndex != morph_second->meshIndex);
+    CHECK(render_scene.meshes[first->meshIndex].submeshes[0].materialIndex == 0);
+    CHECK(render_scene.meshes[other_material->meshIndex].submeshes[0].materialIndex == 1);
+    CHECK(morph_first->morphWeights.size() == 2);
+    CHECK(morph_second->morphWeights.size() == 2);
 
     REQUIRE(loader.Destroy(instance.Value()));
 }
@@ -1264,10 +1390,34 @@ TEST_CASE("hbg shader bootstrap materializes manifest and binaries with cleanup"
     const std::string manifest = ReadText(materialized.Value().root / "manifest.json");
     CHECK(manifest.find("\"dxbc\"") != std::string::npos);
     CHECK(manifest.find("\"fragments\"") != std::string::npos);
+    CHECK(manifest.find("\"fragment\":\"") != std::string::npos);
     CHECK(manifest.find("forward.vs.bin") != std::string::npos);
     const auto vertex_bytes =
         ReadBytes(materialized.Value().root / "build" / "dxbc" / "forward.vs.bin");
     CHECK(vertex_bytes.size() == 3);
+
+    std::atomic<int> concurrent_failures{0};
+    std::vector<std::thread> workers;
+    for (int index = 0; index < 4; ++index) {
+        workers.emplace_back([&] {
+            if (!parcel_hbg::ShaderLibraryBootstrap::Materialize(library, options)) {
+                concurrent_failures.fetch_add(1);
+            }
+        });
+    }
+    for (std::thread& worker : workers) {
+        worker.join();
+    }
+    CHECK(concurrent_failures.load() == 0);
+    CHECK(std::filesystem::exists(materialized.Value().root / "manifest.json"));
+    std::size_t temporary_files = 0;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(options.cache_root)) {
+        if (entry.is_regular_file() &&
+            entry.path().filename().string().find(".tmp.") != std::string::npos) {
+            ++temporary_files;
+        }
+    }
+    CHECK(temporary_files == 0);
 
     const std::filesystem::path old =
         options.cache_root / "parcel" / "game" / "shader_library" / "old";
@@ -1296,6 +1446,36 @@ TEST_CASE("hbg shader bootstrap materializes manifest and binaries with cleanup"
     REQUIRE(initialized);
     CHECK(fake.initialized);
     CHECK(fake.root_seen == materialized.Value().root);
+
+    const std::filesystem::path blobs =
+        options.cache_root / "parcel" / "game" / "shader_library" / ".blobs";
+    const auto count_blobs = [&blobs]() {
+        std::size_t count = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(blobs)) {
+            if (entry.is_regular_file()) {
+                ++count;
+            }
+        }
+        return count;
+    };
+
+    parcel::assets::ShaderLibraryAsset second = library;
+    second.name = "TestShadersV2";
+    auto second_materialized = parcel_hbg::ShaderLibraryBootstrap::Materialize(second, options);
+    REQUIRE(second_materialized);
+    CHECK(count_blobs() == 2);
+
+    auto second_removed = parcel_hbg::ShaderLibraryBootstrap::CleanupOldVersions(
+        options, second_materialized.Value().content_hash);
+    REQUIRE(second_removed);
+    CHECK(second_removed.Value() == 1);
+    CHECK_FALSE(std::filesystem::exists(materialized.Value().root));
+    CHECK(std::filesystem::exists(second_materialized.Value().root));
+
+    auto all_removed = parcel_hbg::ShaderLibraryBootstrap::CleanupOldVersions(options, "");
+    REQUIRE(all_removed);
+    CHECK(all_removed.Value() == 1);
+    CHECK(count_blobs() == 0);
 
     parcel::assets::ShaderLibraryAsset empty;
     auto empty_result = parcel_hbg::ShaderLibraryBootstrap::Materialize(empty, options);

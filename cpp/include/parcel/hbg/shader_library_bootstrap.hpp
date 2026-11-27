@@ -17,6 +17,7 @@ using parcel::core::Result;
 struct ShaderMaterializeOptions {
     std::filesystem::path cache_root;
     std::string package;
+    bool use_hard_links = true;
 };
 
 struct ShaderMaterialization {

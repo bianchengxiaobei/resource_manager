@@ -35,9 +35,11 @@ R00-R08。
 
 ### Sanitizers
 
-- [x] ASan（MSVC，全量测试通过）。
-- [x] UBSan（ClangCL 17 + MSVC STL，225 cases / 6162 assertions；`scripts/run-ubsan.ps1`）。
-- [ ] TSan（线程池/下载/调度，如可行）。
+- [x] ASan（MSVC，全量测试通过；并发 provider 启动 UAF 已由 `OperationBase::Start` 原子 one-shot guard 修复）。
+- [x] UBSan（ClangCL 17 + MSVC STL，230 cases / 6329 assertions；`scripts/run-ubsan.ps1`）。
+- [ ] TSan（线程池/下载/调度，如可行；Windows Clang 17 的 clang++/clang-cl 对
+  `x86_64-pc-windows-msvc` 报 `unsupported option '-fsanitize=thread'`，WSL 未安装，
+  需 Linux/CI 环境）。
 - [x] MSVC ASan（可选）。
 - [x] 清零已知 ASan 问题。
 
@@ -48,7 +50,15 @@ R00-R08。
 - [x] 主线程帧预算（1k 独立 Raw Bundle，4ms 分帧卸载；Debug p95 1.6ms，OS 离群点 5.2ms；`parcel_performance`）。
 - [x] 下载并发（多 worker、跨 Downloader/按需共享同一 Bundle in-flight gate）。
 - [x] WinHTTP loopback 连接句柄复用（session/connection pool；`[.winhttp]` 统计验证）。
-- [ ] 真实 CDN/TLS/吞吐（loopback 已通过；真实 CDN 未跑）。
+- [x] 真实 CDN/TLS/吞吐（`scripts/run-cdn-smoke.ps1`：Cloudflare 8 MiB，HTTPS 证书校验、
+  连接复用和传输吞吐通过）。
+- [x] 真实 CDN 上的完整 Bundle 安装（`scripts/run-cdn-bundle-smoke.ps1`：GitHub raw
+  328 B fixture，HTTPS 下载、SHA-256/CRC 校验、缓存安装与 `VerifyCache` 通过）。
+- [x] 大规模下载基准（`scripts/run-download-bench.ps1`：512 bundle / 31.94 MiB
+  loopback WinHTTP，8 并发；Debug 4864ms/6.57 MiB/s，Release 4079-4455ms/7.17-7.83 MiB/s；
+  512 requests、8 connections、504 reused；安装与 `VerifyCache` 通过）。
+- [ ] 真实 CDN 边缘签名 URL/鉴权流程（真实 Parcel 服务端的 loopback 签名链路已由
+  `scripts/run-signed-url-smoke.ps1` 覆盖，含 403/401 和过期重取；CDN 边缘仍需宿主配置）。
 - [x] 缓存扫描启动时间（10k `.bundle` fixture，`parcel_bench`）。
 - [x] 缓存批量校验（Metadata/Size/Content；1-32 worker 并发；损坏删除、缺失跳过、跨 Bundle 继续）。
 - [x] 缓存批量校验吞吐（10k/1 KiB：串行 14.8s、8 worker 9.1s；`parcel_bench`）。

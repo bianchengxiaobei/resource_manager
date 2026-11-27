@@ -90,6 +90,10 @@ void OperationBase::OnComplete(OperationCompletion callback) {
 }
 
 void OperationBase::Start() {
+    bool expected = false;
+    if (!start_guard_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
     if (status_ != OperationStatus::None) {
         return;
     }

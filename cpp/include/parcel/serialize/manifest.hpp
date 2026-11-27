@@ -23,6 +23,7 @@ inline constexpr std::uint32_t kManifestFlagSupportExtensionless = 1U << 1U;
 inline constexpr std::uint32_t kManifestFlagLocationToLower = 1U << 2U;
 inline constexpr std::uint32_t kManifestFlagIncludeAssetGuid = 1U << 3U;
 inline constexpr std::uint32_t kManifestFlagReplaceAssetPathWithAddress = 1U << 4U;
+inline constexpr std::uint32_t kManifestAssetFlagArchiveRaw = 1U << 0U;
 inline constexpr std::size_t kManifestContentHashOffset = 96;
 
 struct ManifestHeader {

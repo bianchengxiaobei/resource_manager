@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import { computed, onMounted, reactive, ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import * as api from "./api/client";
@@ -151,6 +151,79 @@ async function submitPackage() {
     ElMessage.error(errorMessage(error));
   } finally {
     busy.value = false;
+  }
+}
+
+async function renameCurrentPackage() {
+  if (!selectedPackage.value) return;
+  try {
+    const { value } = await ElMessageBox.prompt("输入新的包名", "重命名包", {
+      inputValue: selectedPackage.value,
+      confirmButtonText: "重命名",
+      cancelButtonText: "取消",
+      inputPattern: /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/,
+      inputErrorMessage: "包名只能包含字母、数字、点、下划线和连字符",
+    });
+    const name = value.trim();
+    if (!name || name === selectedPackage.value) return;
+    const updated = await api.renamePackage(selectedPackage.value, name);
+    selectedPackage.value = updated.name;
+    await refreshPackages();
+    ElMessage.success("包已重命名");
+  } catch (error) {
+    if (error !== "cancel" && error !== "close") ElMessage.error(errorMessage(error));
+  }
+}
+
+async function removeCurrentPackage() {
+  if (!selectedPackage.value) return;
+  try {
+    await ElMessageBox.confirm(
+      `删除包 ${selectedPackage.value} 及其所有版本？此操作不可恢复。`,
+      "删除包",
+      { confirmButtonText: "删除", cancelButtonText: "取消", type: "warning" },
+    );
+    await api.deletePackage(selectedPackage.value);
+    selectedPackage.value = "";
+    await refreshPackages();
+    ElMessage.success("包已删除");
+  } catch (error) {
+    if (error !== "cancel" && error !== "close") ElMessage.error(errorMessage(error));
+  }
+}
+
+async function renameCurrentVersion(version: api.Version) {
+  try {
+    const { value } = await ElMessageBox.prompt("输入新的版本号", "重命名版本", {
+      inputValue: version.version,
+      confirmButtonText: "重命名",
+      cancelButtonText: "取消",
+      inputPattern: /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/,
+      inputErrorMessage: "版本号只能包含字母、数字、点、下划线和连字符",
+    });
+    const name = value.trim();
+    if (!name || name === version.version) return;
+    await api.renameVersion(selectedPackage.value, version.version, name);
+    await refreshDetail();
+    ElMessage.success("版本已重命名");
+  } catch (error) {
+    if (error !== "cancel" && error !== "close") ElMessage.error(errorMessage(error));
+  }
+}
+
+async function removeVersion(version: api.Version) {
+  try {
+    await ElMessageBox.confirm(`删除版本 ${version.version}？`, "删除版本", {
+      confirmButtonText: "删除",
+      cancelButtonText: "取消",
+      type: "warning",
+    });
+    await api.deleteVersion(selectedPackage.value, version.version);
+    await refreshDetail();
+    await refreshPackages();
+    ElMessage.success("版本已删除");
+  } catch (error) {
+    if (error !== "cancel" && error !== "close") ElMessage.error(errorMessage(error));
   }
 }
 
@@ -423,6 +496,8 @@ function errorMessage(error: unknown) {
                 <div class="row">
                   <el-button @click="openUpload">上传版本</el-button>
                   <el-button @click="openRollback()">回滚</el-button>
+                  <el-button v-if="isAdmin" @click="renameCurrentPackage">重命名包</el-button>
+                  <el-button v-if="isAdmin" type="danger" plain @click="removeCurrentPackage">删除包</el-button>
                 </div>
               </div>
               <el-table :data="versions" empty-text="暂无版本">
@@ -440,10 +515,12 @@ function errorMessage(error: unknown) {
                 <el-table-column label="创建时间" width="180">
                   <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
                 </el-table-column>
-                <el-table-column label="操作" width="180">
+                <el-table-column label="操作" width="300">
                   <template #default="{ row }">
                     <el-button link type="primary" @click="publishVersion(row)">发布</el-button>
                     <el-button link type="warning" @click="openRollback(row.version)">回滚到此版本</el-button>
+                    <el-button v-if="isAdmin" link type="primary" @click="renameCurrentVersion(row)">重命名</el-button>
+                    <el-button v-if="isAdmin" link type="danger" @click="removeVersion(row)">删除</el-button>
                   </template>
                 </el-table-column>
               </el-table>

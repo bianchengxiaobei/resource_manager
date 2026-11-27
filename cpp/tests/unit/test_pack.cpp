@@ -1,4 +1,4 @@
-﻿#include <catch_amalgamated.hpp>
+#include <catch_amalgamated.hpp>
 
 #include "parcel/assets/asset_codec.hpp"
 #include "parcel/assets/json.hpp"
@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -168,12 +169,16 @@ TEST_CASE("pack config parses collector rules") {
         "package": "game",
         "version": "2.0.0",
         "target": "windows",
+        "source": "assets",
         "cooked": "cooked",
         "output": "build",
         "compression": "zstd",
         "blockSize": 131072,
+        "verifyOutput": true,
         "writeBuiltinCatalog": false,
         "enableAddressable": false,
+        "useSourcePath": false,
+        "forceSubAssetGrouping": false,
         "collectors": [
             {
                 "name": "main",
@@ -181,8 +186,14 @@ TEST_CASE("pack config parses collector rules") {
                 "path": "assets",
                 "addressRule": "prefix",
                 "addressPrefix": "ui",
+                "include": ["**/*.prca", "a/*.prca"],
+                "exclude": ["raw/**"],
+                "archive": true,
                 "tags": ["base", "ui"],
-                "bundle": "ui"
+                "bundle": "ui",
+                "group": "ui-group",
+                "packRule": "PackDirectory",
+                "filterRule": "CollectMaterial"
             },
             {
                 "name": "deps",
@@ -199,18 +210,523 @@ TEST_CASE("pack config parses collector rules") {
     const auto& config = loaded.Value();
     REQUIRE(config.package_name == "game");
     REQUIRE(config.package_version == "2.0.0");
+    REQUIRE(config.source_root == "assets");
+    REQUIRE_FALSE(config.use_source_path);
+    REQUIRE_FALSE(config.force_sub_asset_grouping);
     REQUIRE(config.compression == serialize::CompressionCodec::Zstd);
     REQUIRE(config.block_size == 131072);
+    REQUIRE(config.verify_output_hashes);
     REQUIRE_FALSE(config.write_builtin_catalog);
     REQUIRE_FALSE(config.enable_addressable);
     REQUIRE(config.collectors.size() == 2);
     REQUIRE(config.collectors[0].address_rule == parcel::pack::AddressRule::Prefix);
     REQUIRE(config.collectors[0].address_prefix == "ui");
+    REQUIRE(config.collectors[0].include_patterns ==
+            std::vector<std::string>{"**/*.prca", "a/*.prca"});
+    REQUIRE(config.collectors[0].exclude_patterns == std::vector<std::string>{"raw/**"});
     REQUIRE(config.collectors[0].tags == std::vector<std::string>{"base", "ui"});
     REQUIRE(config.collectors[0].bundle == "ui");
+    REQUIRE(config.collectors[0].group == "ui-group");
+    REQUIRE(config.collectors[0].pack_rule == parcel::pack::PackRule::PackDirectory);
+    REQUIRE(config.collectors[0].filter_rule == parcel::pack::FilterRule::CollectMaterial);
+    REQUIRE(config.collectors[0].archive);
     REQUIRE(config.collectors[1].type == parcel::pack::CollectorType::Depend);
     REQUIRE(config.collectors[1].address_rule == parcel::pack::AddressRule::Address);
     REQUIRE(config.collectors[1].address == "fixed/address");
+}
+
+TEST_CASE("pack config parses TOML collector rules") {
+    TempDir directory{"pack_config_toml"};
+    const auto path = directory.Path() / "pack.toml";
+    WriteText(path, R"(# TOML pack config
+package = "game"
+version = "3.0.0"
+target = "linux"
+source = "assets"
+cooked = "cooked"
+output = "build"
+compression = "zstd"
+blockSize = 131072
+jobs = 4
+verifyOutput = true
+writeBuiltinCatalog = false
+autoCollectShaders = false
+enableShareBundle = false
+singleReferencedPackAlone = true
+
+[[collectors]]
+name = "main"
+type = "main"
+path = "assets"
+include = [
+  "**/*.prca", # all cooked assets
+  "[ab]/*.prca",
+]
+exclude = ["raw/**"]
+archive = true
+recursive = false
+addressRule = "prefix"
+addressPrefix = "ui"
+tags = ["base", "ui"]
+bundle = 'ui'
+group = "ui-group"
+packRule = "PackCollector"
+filterRule = "CollectTexture"
+
+[[collectors]]
+name = "deps"
+type = "depend"
+files = ["shader.bin"]
+include = []
+share = false
+)");
+
+    auto loaded = parcel::pack::LoadPackConfig(ToUtf8(path));
+    REQUIRE(loaded);
+    const auto& config = loaded.Value();
+    REQUIRE(config.package_name == "game");
+    REQUIRE(config.package_version == "3.0.0");
+    REQUIRE(config.target == "linux");
+    REQUIRE(config.source_root == "assets");
+    REQUIRE(config.compression == serialize::CompressionCodec::Zstd);
+    REQUIRE(config.block_size == 131072);
+    REQUIRE(config.jobs == 4);
+    REQUIRE(config.verify_output_hashes);
+    REQUIRE_FALSE(config.write_builtin_catalog);
+    REQUIRE_FALSE(config.auto_collect_shaders);
+    REQUIRE_FALSE(config.enable_share_bundle);
+    REQUIRE(config.single_referenced_pack_alone);
+    REQUIRE(config.collectors.size() == 2);
+    REQUIRE(config.collectors[0].include_patterns ==
+            std::vector<std::string>{"**/*.prca", "[ab]/*.prca"});
+    REQUIRE(config.collectors[0].exclude_patterns == std::vector<std::string>{"raw/**"});
+    REQUIRE_FALSE(config.collectors[0].recursive);
+    REQUIRE(config.collectors[0].address_prefix == "ui");
+    REQUIRE(config.collectors[0].tags == std::vector<std::string>{"base", "ui"});
+    REQUIRE(config.collectors[0].bundle == "ui");
+    REQUIRE(config.collectors[0].group == "ui-group");
+    REQUIRE(config.collectors[0].pack_rule == parcel::pack::PackRule::PackCollector);
+    REQUIRE(config.collectors[0].filter_rule == parcel::pack::FilterRule::CollectTexture);
+    REQUIRE(config.collectors[0].archive);
+    REQUIRE(config.collectors[1].type == parcel::pack::CollectorType::Depend);
+    REQUIRE(config.collectors[1].files == std::vector<std::string>{"shader.bin"});
+    REQUIRE(config.collectors[1].include_patterns.empty());
+    REQUIRE_FALSE(config.collectors[1].share);
+}
+
+TEST_CASE("pack config rejects malformed TOML") {
+    TempDir directory{"pack_config_toml_bad"};
+    const auto path = directory.Path() / "pack.toml";
+    const std::array<std::string_view, 5> invalid = {
+        "package = \"game\"\n[[collectors]\nname = \"main\"\n",
+        "package = \"game\"\nname = \"a\"\nname = \"b\"\n",
+        "package = \"game\"\nunsupported = { value = 1 }\n",
+        "package = \"game\"\n[[other]]\nname = \"main\"\n",
+        "package = \"game\"\n[[collectors]]\ninclude = [\"a\",\n",
+    };
+    for (const std::string_view text : invalid) {
+        WriteText(path, text);
+        auto loaded = parcel::pack::LoadPackConfig(ToUtf8(path));
+        REQUIRE_FALSE(loaded);
+        REQUIRE(loaded.GetError().code == core::ErrorCode::InvalidArgument);
+    }
+}
+
+TEST_CASE("pack config rejects unknown pack and filter rules") {
+    TempDir directory{"pack_config_rules"};
+    const auto path = directory.Path() / "pack.json";
+    SECTION("unknown pack rule") {
+        WriteText(path, R"({
+            "package": "game",
+            "version": "1.0.0",
+            "cooked": "cooked",
+            "output": "build",
+            "collectors": [{"packRule": "PackBogus"}]
+        })");
+        auto loaded = parcel::pack::LoadPackConfig(ToUtf8(path));
+        REQUIRE_FALSE(loaded);
+        REQUIRE(loaded.GetError().code == core::ErrorCode::InvalidArgument);
+    }
+    SECTION("unknown filter rule") {
+        WriteText(path, R"({
+            "package": "game",
+            "version": "1.0.0",
+            "cooked": "cooked",
+            "output": "build",
+            "collectors": [{"filterRule": "CollectBogus"}]
+        })");
+        auto loaded = parcel::pack::LoadPackConfig(ToUtf8(path));
+        REQUIRE_FALSE(loaded);
+        REQUIRE(loaded.GetError().code == core::ErrorCode::InvalidArgument);
+    }
+}
+
+TEST_CASE("pack collectors expand include and exclude globs") {
+    PackFixture fixture;
+    auto config = fixture.Config();
+    config.collectors.clear();
+    auto collector = fixture.Collector("glob", parcel::pack::CollectorType::Main, "");
+    collector.include_patterns = {"**/*.prca"};
+    collector.exclude_patterns = {"raw/**"};
+    config.collectors.push_back(std::move(collector));
+
+    auto packed = parcel::pack::RunPack(config);
+    REQUIRE(packed);
+    const auto& report = packed.Value().report;
+    REQUIRE(report.errors.empty());
+    REQUIRE(report.asset_count == 3);
+    REQUIRE(report.main_asset_count == 3);
+    for (const auto& asset : report.assets) {
+        REQUIRE(asset.guid != fixture.raw_guid);
+    }
+}
+
+TEST_CASE("pack collector globs support character classes") {
+    PackFixture fixture;
+    auto config = fixture.Config();
+    config.collectors.clear();
+    auto main_collector = fixture.Collector("main", parcel::pack::CollectorType::Main, "");
+    main_collector.include_patterns = {"[ab]/*.prca"};
+    config.collectors.push_back(std::move(main_collector));
+    auto texture_collector =
+        fixture.Collector("textures", parcel::pack::CollectorType::Depend, "textures");
+    texture_collector.include_patterns = {"*.prca"};
+    config.collectors.push_back(std::move(texture_collector));
+
+    auto packed = parcel::pack::RunPack(config);
+    REQUIRE(packed);
+    REQUIRE(packed.Value().report.asset_count == 3);
+    REQUIRE(packed.Value().report.main_asset_count == 2);
+}
+
+TEST_CASE("pack rejects collector globs that escape the cooked root") {
+    PackFixture fixture;
+    auto config = fixture.Config();
+    config.collectors.clear();
+    auto collector = fixture.Collector("glob", parcel::pack::CollectorType::Main, "");
+    collector.include_patterns = {"../*.prca"};
+    config.collectors.push_back(std::move(collector));
+
+    auto packed = parcel::pack::RunPack(config);
+    REQUIRE_FALSE(packed);
+    REQUIRE(packed.GetError().code == core::ErrorCode::InvalidArgument);
+}
+
+TEST_CASE("pack groups archive raw files into one bundle") {
+    PackFixture fixture;
+    assets::RawFileAsset second_raw;
+    second_raw.name = "payload-2";
+    second_raw.data = {std::byte{4}, std::byte{5}};
+    const AssetGuid second_guid =
+        WriteAsset(fixture.cooked, "raw", "payload-2", second_raw, fixture.registry);
+
+    auto config = fixture.Config();
+    config.verify_output_hashes = true;
+    for (auto& collector : config.collectors) {
+        if (collector.name == "raw") {
+            collector.archive = true;
+        }
+    }
+
+    auto packed = parcel::pack::RunPack(config);
+    REQUIRE(packed);
+    const auto& summary = packed.Value();
+    REQUIRE(summary.report.errors.empty());
+    REQUIRE(summary.report.asset_count == 5);
+    REQUIRE(summary.report.main_asset_count == 4);
+    REQUIRE(summary.report.bundle_count == 4);
+    REQUIRE(summary.report.output_verified);
+
+    auto manifest = serialize::LoadManifestFile(OutputFile(summary, "manifest.bytes"), true);
+    REQUIRE(manifest);
+    const auto* raw_view = manifest.Value().FindAssetByGuid(fixture.raw_guid);
+    const auto* second_view = manifest.Value().FindAssetByGuid(second_guid);
+    REQUIRE(raw_view != nullptr);
+    REQUIRE(second_view != nullptr);
+    REQUIRE((raw_view->flags & serialize::kManifestAssetFlagArchiveRaw) != 0);
+    REQUIRE((second_view->flags & serialize::kManifestAssetFlagArchiveRaw) != 0);
+
+    const auto* bundle_view = manifest.Value().FindBundleByName("raw");
+    REQUIRE(bundle_view != nullptr);
+    const auto bytes = ReadFile(std::filesystem::path(summary.output_directory) / "bundles" /
+                                std::string(bundle_view->file_name));
+    auto reader = serialize::BundleReader::Open(bytes, true);
+    REQUIRE(reader);
+    REQUIRE(reader.Value().ReadAll(true));
+    REQUIRE(reader.Value().Toc().payloads.empty());
+    REQUIRE(reader.Value().Toc().raw_files.size() == 2);
+
+    std::vector<std::string> names;
+    for (const auto& raw : reader.Value().Toc().raw_files) {
+        names.push_back(raw.name);
+        auto data = reader.Value().ReadLogical(raw.logical_offset, raw.size);
+        REQUIRE(data);
+        if (raw.name == raw_view->asset_path) {
+            REQUIRE(data.Value() ==
+                    std::vector<std::byte>{std::byte{1}, std::byte{2}, std::byte{3}});
+        } else {
+            REQUIRE(raw.name == second_view->asset_path);
+            REQUIRE(data.Value() == std::vector<std::byte>{std::byte{4}, std::byte{5}});
+        }
+    }
+    REQUIRE(std::find(names.begin(), names.end(), raw_view->asset_path) != names.end());
+    REQUIRE(std::find(names.begin(), names.end(), second_view->asset_path) != names.end());
+}
+
+TEST_CASE("pack collector filter rule selects cooked asset types") {
+    PackFixture fixture;
+    auto config = fixture.Config();
+    config.collectors.clear();
+    auto collector =
+        fixture.Collector("textures-only", parcel::pack::CollectorType::Main, "textures");
+    collector.filter_rule = parcel::pack::FilterRule::CollectTexture;
+    config.collectors.push_back(std::move(collector));
+
+    auto packed = parcel::pack::RunPack(config);
+    REQUIRE(packed);
+    REQUIRE(packed.Value().report.asset_count == 1);
+    REQUIRE(packed.Value().report.bundle_count == 1);
+
+    auto manifest = serialize::LoadManifestFile(OutputFile(packed.Value(), "manifest.bytes"), true);
+    REQUIRE(manifest);
+    REQUIRE(manifest.Value().Assets().size() == 1);
+    REQUIRE(manifest.Value().Assets().front().type_name == "TextureAsset");
+    REQUIRE(manifest.Value().FindAssetByGuid(fixture.texture_guid) != nullptr);
+    REQUIRE(manifest.Value().FindAssetByGuid(fixture.material_a_guid) == nullptr);
+}
+
+TEST_CASE("pack filters fall back to the next matching collector") {
+    PackFixture fixture;
+    auto config = fixture.Config();
+    config.collectors.clear();
+    auto scene_only =
+        fixture.Collector("scene-only", parcel::pack::CollectorType::Main, "textures");
+    scene_only.filter_rule = parcel::pack::FilterRule::CollectScene;
+    config.collectors.push_back(std::move(scene_only));
+    auto texture_only =
+        fixture.Collector("texture-only", parcel::pack::CollectorType::Main, "textures");
+    texture_only.filter_rule = parcel::pack::FilterRule::CollectTexture;
+    config.collectors.push_back(std::move(texture_only));
+
+    auto packed = parcel::pack::RunPack(config);
+    REQUIRE(packed);
+    REQUIRE(packed.Value().report.asset_count == 1);
+    REQUIRE(packed.Value().report.warnings.empty());
+
+    auto manifest = serialize::LoadManifestFile(OutputFile(packed.Value(), "manifest.bytes"), true);
+    REQUIRE(manifest);
+    REQUIRE(manifest.Value().FindAssetByGuid(fixture.texture_guid) != nullptr);
+}
+
+TEST_CASE("pack rules control material bundle grouping") {
+    PackFixture fixture;
+    assets::MaterialAsset second_material;
+    second_material.name = "material-a2";
+    second_material.base_color_texture.texture = fixture.texture_guid;
+    const AssetGuid second_material_guid =
+        WriteAsset(fixture.cooked, "a", "material-a2", second_material, fixture.registry);
+
+    SECTION("PackSeparately creates one bundle per material") {
+        auto config = fixture.Config();
+        config.collectors.clear();
+        auto collector = fixture.Collector("materials", parcel::pack::CollectorType::Main, "a");
+        collector.filter_rule = parcel::pack::FilterRule::CollectMaterial;
+        collector.pack_rule = parcel::pack::PackRule::PackSeparately;
+        config.collectors.push_back(std::move(collector));
+
+        auto packed = parcel::pack::RunPack(config);
+        REQUIRE(packed);
+        REQUIRE(packed.Value().report.bundle_count == 3);
+        auto manifest =
+            serialize::LoadManifestFile(OutputFile(packed.Value(), "manifest.bytes"), true);
+        REQUIRE(manifest);
+        const auto* first = manifest.Value().FindAssetByGuid(fixture.material_a_guid);
+        const auto* second = manifest.Value().FindAssetByGuid(second_material_guid);
+        REQUIRE(first != nullptr);
+        REQUIRE(second != nullptr);
+        REQUIRE(first->bundle_index != second->bundle_index);
+        REQUIRE(
+            manifest.Value().Bundles()[first->bundle_index].bundle_name.starts_with("separate/"));
+        REQUIRE(
+            manifest.Value().Bundles()[second->bundle_index].bundle_name.starts_with("separate/"));
+    }
+
+    SECTION("PackCollector groups assets under the collector name") {
+        auto config = fixture.Config();
+        config.collectors.clear();
+        auto collector = fixture.Collector("materials", parcel::pack::CollectorType::Main, "a");
+        collector.filter_rule = parcel::pack::FilterRule::CollectMaterial;
+        collector.pack_rule = parcel::pack::PackRule::PackCollector;
+        config.collectors.push_back(std::move(collector));
+
+        auto packed = parcel::pack::RunPack(config);
+        REQUIRE(packed);
+        REQUIRE(packed.Value().report.bundle_count == 1);
+        auto manifest =
+            serialize::LoadManifestFile(OutputFile(packed.Value(), "manifest.bytes"), true);
+        REQUIRE(manifest);
+        const auto* first = manifest.Value().FindAssetByGuid(fixture.material_a_guid);
+        const auto* second = manifest.Value().FindAssetByGuid(second_material_guid);
+        REQUIRE(first != nullptr);
+        REQUIRE(second != nullptr);
+        REQUIRE(first->bundle_index == second->bundle_index);
+        REQUIRE(manifest.Value().Bundles()[first->bundle_index].bundle_name == "materials");
+    }
+
+    SECTION("PackGroup groups assets under the configured group") {
+        auto config = fixture.Config();
+        config.collectors.clear();
+        auto collector = fixture.Collector("materials", parcel::pack::CollectorType::Main, "a");
+        collector.filter_rule = parcel::pack::FilterRule::CollectMaterial;
+        collector.pack_rule = parcel::pack::PackRule::PackGroup;
+        collector.group = "ui";
+        config.collectors.push_back(std::move(collector));
+
+        auto packed = parcel::pack::RunPack(config);
+        REQUIRE(packed);
+        REQUIRE(packed.Value().report.bundle_count == 1);
+        auto manifest =
+            serialize::LoadManifestFile(OutputFile(packed.Value(), "manifest.bytes"), true);
+        REQUIRE(manifest);
+        const auto* first = manifest.Value().FindAssetByGuid(fixture.material_a_guid);
+        REQUIRE(first != nullptr);
+        REQUIRE(manifest.Value().Bundles()[first->bundle_index].bundle_name == "ui");
+    }
+
+    SECTION("explicit bundle name overrides the pack rule") {
+        auto config = fixture.Config();
+        config.collectors.clear();
+        auto collector = fixture.Collector("materials", parcel::pack::CollectorType::Main, "a");
+        collector.filter_rule = parcel::pack::FilterRule::CollectMaterial;
+        collector.pack_rule = parcel::pack::PackRule::PackSeparately;
+        collector.bundle = "fixed";
+        config.collectors.push_back(std::move(collector));
+
+        auto packed = parcel::pack::RunPack(config);
+        REQUIRE(packed);
+        REQUIRE(packed.Value().report.bundle_count == 1);
+        auto manifest =
+            serialize::LoadManifestFile(OutputFile(packed.Value(), "manifest.bytes"), true);
+        REQUIRE(manifest);
+        const auto* first = manifest.Value().FindAssetByGuid(fixture.material_a_guid);
+        REQUIRE(first != nullptr);
+        REQUIRE(manifest.Value().Bundles()[first->bundle_index].bundle_name == "fixed");
+    }
+}
+
+TEST_CASE("pack outputNameStyle controls bundle file names") {
+    PackFixture fixture;
+
+    SECTION("HashName keeps the legacy GUID file name") {
+        auto config = fixture.Config();
+        config.output_name_style = 1;
+        auto packed = parcel::pack::RunPack(config);
+        REQUIRE(packed);
+        auto manifest =
+            serialize::LoadManifestFile(OutputFile(packed.Value(), "manifest.bytes"), true);
+        REQUIRE(manifest);
+        for (const auto& bundle : manifest.Value().Bundles()) {
+            REQUIRE(bundle.file_name == bundle.bundle_guid.ToHex() + ".bundle");
+        }
+    }
+
+    SECTION("BundleName uses the sanitized bundle name") {
+        auto config = fixture.Config();
+        config.output_name_style = 2;
+        auto packed = parcel::pack::RunPack(config);
+        REQUIRE(packed);
+        auto manifest =
+            serialize::LoadManifestFile(OutputFile(packed.Value(), "manifest.bytes"), true);
+        REQUIRE(manifest);
+        const auto* bundle = manifest.Value().FindBundleByName("a");
+        REQUIRE(bundle != nullptr);
+        REQUIRE(bundle->file_name == "a.bundle");
+        const auto* shared = manifest.Value().FindBundleByName("shared/textures");
+        REQUIRE(shared != nullptr);
+        REQUIRE(shared->file_name == "shared_textures.bundle");
+    }
+
+    SECTION("BundleNameHashName includes both name and GUID") {
+        auto config = fixture.Config();
+        config.output_name_style = 3;
+        auto packed = parcel::pack::RunPack(config);
+        REQUIRE(packed);
+        auto manifest =
+            serialize::LoadManifestFile(OutputFile(packed.Value(), "manifest.bytes"), true);
+        REQUIRE(manifest);
+        const auto* bundle = manifest.Value().FindBundleByName("a");
+        REQUIRE(bundle != nullptr);
+        REQUIRE(bundle->file_name == "a_" + bundle->bundle_guid.ToHex() + ".bundle");
+    }
+
+    SECTION("unknown styles are rejected") {
+        auto config = fixture.Config();
+        config.output_name_style = 4;
+        auto packed = parcel::pack::RunPack(config);
+        REQUIRE_FALSE(packed);
+        REQUIRE(packed.GetError().code == core::ErrorCode::InvalidArgument);
+    }
+}
+
+TEST_CASE("pack buildBundleType controls raw archive output") {
+    PackFixture fixture;
+
+    SECTION("Archive forces raw assets into archive bundles") {
+        auto config = fixture.Config();
+        config.build_bundle_type = 3;
+        auto packed = parcel::pack::RunPack(config);
+        REQUIRE(packed);
+        auto manifest =
+            serialize::LoadManifestFile(OutputFile(packed.Value(), "manifest.bytes"), true);
+        REQUIRE(manifest);
+        const auto* raw = manifest.Value().FindAssetByGuid(fixture.raw_guid);
+        REQUIRE(raw != nullptr);
+        REQUIRE((raw->flags & serialize::kManifestAssetFlagArchiveRaw) != 0);
+        const auto* bundle = manifest.Value().FindBundleByName("raw");
+        REQUIRE(bundle != nullptr);
+        const auto bytes = ReadFile(std::filesystem::path(packed.Value().output_directory) /
+                                    "bundles" / std::string(bundle->file_name));
+        auto reader = serialize::BundleReader::Open(bytes, true);
+        REQUIRE(reader);
+        REQUIRE(reader.Value().ReadAll(true));
+        REQUIRE(reader.Value().Toc().raw_files.size() == 1);
+    }
+
+    SECTION("RawFile is rejected") {
+        auto config = fixture.Config();
+        config.build_bundle_type = 2;
+        auto packed = parcel::pack::RunPack(config);
+        REQUIRE_FALSE(packed);
+        REQUIRE(packed.GetError().code == core::ErrorCode::Unsupported);
+    }
+
+    SECTION("unknown values are rejected") {
+        auto config = fixture.Config();
+        config.build_bundle_type = 4;
+        auto packed = parcel::pack::RunPack(config);
+        REQUIRE_FALSE(packed);
+        REQUIRE(packed.GetError().code == core::ErrorCode::InvalidArgument);
+    }
+}
+
+TEST_CASE("pack rejects unsupported collector filter and pack rules") {
+    PackFixture fixture;
+
+    SECTION("unsupported filter rule") {
+        auto config = fixture.Config();
+        config.collectors[0].filter_rule = parcel::pack::FilterRule::CollectPrefab;
+        auto packed = parcel::pack::RunPack(config);
+        REQUIRE_FALSE(packed);
+        REQUIRE(packed.GetError().code == core::ErrorCode::Unsupported);
+    }
+
+    SECTION("unsupported pack rule") {
+        auto config = fixture.Config();
+        config.collectors[0].pack_rule = parcel::pack::PackRule::PackShaderVariants;
+        auto packed = parcel::pack::RunPack(config);
+        REQUIRE_FALSE(packed);
+        REQUIRE(packed.GetError().code == core::ErrorCode::Unsupported);
+    }
 }
 
 TEST_CASE("pack produces deterministic bundles, shared dependency and manifest") {
@@ -225,6 +741,7 @@ TEST_CASE("pack produces deterministic bundles, shared dependency and manifest")
     REQUIRE(summary.report.main_asset_count == 3);
     REQUIRE(summary.report.bundle_count == 4);
     REQUIRE(summary.report.reused_bundle_count == 0);
+    REQUIRE(summary.report.reused_asset_count == 0);
 
     auto manifest = serialize::LoadManifestFile(OutputFile(summary, "manifest.bytes"), true);
     REQUIRE(manifest);
@@ -283,9 +800,9 @@ TEST_CASE("pack produces deterministic bundles, shared dependency and manifest")
     REQUIRE(report_json.Value().Find("builtinCatalogBytes")->number_value ==
             static_cast<double>(catalog_bytes.size()));
     for (const serialize::BuiltinCatalogEntry& entry : catalog.Value().entries) {
-        const auto* bundle = manifest.Value().FindBundleByGuid(entry.bundle_guid);
-        REQUIRE(bundle != nullptr);
-        REQUIRE(bundle->file_name == entry.file_name);
+        const auto* bundle_view = manifest.Value().FindBundleByGuid(entry.bundle_guid);
+        REQUIRE(bundle_view != nullptr);
+        REQUIRE(bundle_view->file_name == entry.file_name);
     }
 
     std::vector<std::byte> manifest_first = ReadFile(OutputFile(summary, "manifest.bytes"));
@@ -306,6 +823,7 @@ TEST_CASE("pack produces deterministic bundles, shared dependency and manifest")
     auto second = parcel::pack::RunPack(fixture.Config());
     REQUIRE(second);
     REQUIRE(second.Value().report.reused_bundle_count == second.Value().report.bundle_count);
+    REQUIRE(second.Value().report.reused_asset_count == second.Value().report.asset_count);
     REQUIRE(ReadFile(OutputFile(second.Value(), "manifest.bytes")) == manifest_first);
     REQUIRE(ReadFile(OutputFile(second.Value(), "builtin_catalog.bin")) == catalog_bytes);
     REQUIRE(ReadFile(second.Value().output_directory + "/bundles/" +
@@ -317,6 +835,7 @@ TEST_CASE("pack produces deterministic bundles, shared dependency and manifest")
     auto fresh = parcel::pack::RunPack(fresh_config);
     REQUIRE(fresh);
     REQUIRE(fresh.Value().report.reused_bundle_count == 0);
+    REQUIRE(fresh.Value().report.reused_asset_count == 0);
     REQUIRE(ReadFile(OutputFile(fresh.Value(), "manifest.bytes")) == manifest_first);
     REQUIRE(ReadFile(OutputFile(fresh.Value(), "builtin_catalog.bin")) == catalog_bytes);
 
@@ -325,9 +844,60 @@ TEST_CASE("pack produces deterministic bundles, shared dependency and manifest")
     no_catalog_config.write_builtin_catalog = false;
     auto no_catalog = parcel::pack::RunPack(no_catalog_config);
     REQUIRE(no_catalog);
-    REQUIRE_FALSE(std::filesystem::exists(
-        OutputFile(no_catalog.Value(), "builtin_catalog.bin")));
+    REQUIRE_FALSE(std::filesystem::exists(OutputFile(no_catalog.Value(), "builtin_catalog.bin")));
     REQUIRE(no_catalog.Value().report.builtin_catalog_bytes == 0);
+}
+
+TEST_CASE("pack verifies written output hashes") {
+    PackFixture fixture;
+    auto config = fixture.Config();
+    config.verify_output_hashes = true;
+    auto packed = parcel::pack::RunPack(config);
+    REQUIRE(packed);
+    REQUIRE(packed.Value().report.output_verified);
+    REQUIRE(packed.Value().report.verified_bundle_count == packed.Value().report.bundle_count);
+
+    auto verified = parcel::pack::VerifyPackOutput(packed.Value().output_directory);
+    REQUIRE(verified);
+    REQUIRE(verified.Value().bundle_count == packed.Value().report.bundle_count);
+    REQUIRE(verified.Value().catalog_verified);
+
+    auto manifest = serialize::LoadManifestFile(OutputFile(packed.Value(), "manifest.bytes"), true);
+    REQUIRE(manifest);
+    REQUIRE_FALSE(manifest.Value().Bundles().empty());
+    const std::string bundle_path = packed.Value().output_directory + "/bundles/" +
+                                    std::string(manifest.Value().Bundles().front().file_name);
+    auto bytes = ReadFile(bundle_path);
+    REQUIRE_FALSE(bytes.empty());
+    bytes[0] = std::byte{0};
+    WriteFile(bundle_path, bytes);
+
+    auto corrupted = parcel::pack::VerifyPackOutput(packed.Value().output_directory);
+    REQUIRE_FALSE(corrupted);
+    REQUIRE(corrupted.GetError().code == core::ErrorCode::HashMismatch);
+}
+
+TEST_CASE("pack reuses unchanged assets after one asset changes") {
+    PackFixture fixture;
+    auto first = parcel::pack::RunPack(fixture.Config());
+    REQUIRE(first);
+    const std::vector<std::byte> first_manifest =
+        ReadFile(OutputFile(first.Value(), "manifest.bytes"));
+
+    assets::RawFileAsset changed;
+    changed.name = "payload";
+    changed.data = {std::byte{9}, std::byte{8}, std::byte{7}, std::byte{6}};
+    WriteAsset(fixture.cooked, "raw", "payload", changed, fixture.registry);
+    const auto raw_path = fixture.cooked / "raw" / (fixture.raw_guid.ToHex() + ".prca");
+    std::filesystem::last_write_time(raw_path, std::filesystem::last_write_time(raw_path) +
+                                                   std::chrono::seconds(5));
+
+    auto rebuild = parcel::pack::RunPack(fixture.Config());
+    REQUIRE(rebuild);
+    REQUIRE(rebuild.Value().report.reused_asset_count == 3);
+    REQUIRE(rebuild.Value().report.reused_bundle_count == 3);
+    REQUIRE(rebuild.Value().report.bundle_count == 4);
+    REQUIRE(ReadFile(OutputFile(rebuild.Value(), "manifest.bytes")) != first_manifest);
 }
 
 TEST_CASE("pack keeps a shared dependency inside one referrer bundle") {
@@ -495,6 +1065,120 @@ TEST_CASE("pack rejects cyclic bundle dependencies") {
     REQUIRE(result.GetError().code == core::ErrorCode::InvalidArgument);
 }
 
+TEST_CASE("pack maps parcelmeta source paths and groups subassets") {
+    PackFixture fixture;
+    assets::TextureAsset grouped_texture;
+    grouped_texture.format = assets::TextureFormat::RGBA8;
+    grouped_texture.sRGB = true;
+    grouped_texture.mip_count = 1;
+    assets::TextureMip grouped_mip;
+    grouped_mip.width = 2;
+    grouped_mip.height = 2;
+    grouped_mip.row_pitch = 8;
+    grouped_mip.data.assign(16, std::byte{0x33});
+    grouped_texture.mips.push_back(std::move(grouped_mip));
+    const AssetGuid texture_guid = WriteAsset(fixture.cooked, "group-deps", "group-texture",
+                                              grouped_texture, fixture.registry);
+
+    assets::MaterialAsset grouped_material;
+    grouped_material.name = "group-material";
+    grouped_material.base_color_texture.texture = texture_guid;
+    const AssetGuid material_guid = WriteAsset(fixture.cooked, "group-main", "group-material",
+                                               grouped_material, fixture.registry);
+
+    const AssetGuid source_guid = GuidFrom("group-source");
+    const std::string zero_hash = "sha256:" + std::string(64, '0');
+    const std::string meta_text =
+        "{\n"
+        "  \"version\": 1,\n"
+        "  \"sourceGuid\": \"" +
+        source_guid.ToHex() +
+        "\",\n"
+        "  \"importer\": \"fbx\",\n"
+        "  \"importerVersion\": 8,\n"
+        "  \"sourceHash\": \"" +
+        zero_hash +
+        "\",\n"
+        "  \"settingsHash\": \"" +
+        zero_hash +
+        "\",\n"
+        "  \"settings\": {},\n"
+        "  \"assets\": [\n"
+        "    {\"guid\": \"" +
+        material_guid.ToHex() +
+        "\", \"type\": \"MaterialAsset\", \"role\": \"scene\", \"localId\": \"scene\"},\n"
+        "    {\"guid\": \"" +
+        texture_guid.ToHex() +
+        "\", \"type\": \"TextureAsset\", \"role\": \"texture\", \"localId\": \"texture\"}\n"
+        "  ],\n"
+        "  \"dependencies\": [\"" +
+        texture_guid.ToHex() +
+        "\"]\n"
+        "}\n";
+    WriteText(fixture.project / "assets" / "hero.fbx.parcelmeta", meta_text);
+
+    auto config = fixture.Config();
+    config.source_root = "assets";
+    config.single_referenced_pack_alone = true;
+    config.collectors.push_back(
+        fixture.Collector("group-main", parcel::pack::CollectorType::Main, "group-main"));
+
+    auto packed = parcel::pack::RunPack(config);
+    REQUIRE(packed);
+    const auto& summary = packed.Value();
+    REQUIRE(summary.report.asset_count == 6);
+    REQUIRE(summary.report.main_asset_count == 4);
+    REQUIRE(summary.report.bundle_count == 5);
+
+    const auto material_report = std::find_if(
+        summary.report.assets.begin(), summary.report.assets.end(),
+        [&](const parcel::pack::PackAssetReport& asset) { return asset.guid == material_guid; });
+    REQUIRE(material_report != summary.report.assets.end());
+    CHECK(material_report->path == "group-main/" + material_guid.ToHex() + ".prca");
+    CHECK(material_report->source_path == "assets/hero.fbx");
+    CHECK(material_report->bundle == "assets");
+
+    const auto texture_report = std::find_if(
+        summary.report.assets.begin(), summary.report.assets.end(),
+        [&](const parcel::pack::PackAssetReport& asset) { return asset.guid == texture_guid; });
+    REQUIRE(texture_report != summary.report.assets.end());
+    CHECK(texture_report->path == "group-deps/" + texture_guid.ToHex() + ".prca");
+    CHECK(texture_report->source_path == "assets/hero.fbx");
+    CHECK(texture_report->bundle == "assets");
+
+    const auto group_bundle = std::find_if(
+        summary.report.bundles.begin(), summary.report.bundles.end(),
+        [](const parcel::pack::PackBundleReport& bundle) { return bundle.name == "assets"; });
+    REQUIRE(group_bundle != summary.report.bundles.end());
+    CHECK(group_bundle->asset_count == 2);
+
+    auto manifest = serialize::LoadManifestFile(OutputFile(summary, "manifest.bytes"), true);
+    REQUIRE(manifest);
+    REQUIRE(manifest.Value().Assets().size() == 4);
+    const auto* packed_material = manifest.Value().FindAssetByPath("assets/hero.fbx");
+    REQUIRE(packed_material != nullptr);
+    CHECK(packed_material->address == "assets/hero.fbx");
+    CHECK(manifest.Value().FindAssetByPath("group-main/" + material_guid.ToHex() + ".prca") ==
+          nullptr);
+
+    auto physical_config = config;
+    physical_config.use_source_path = false;
+    physical_config.force_sub_asset_grouping = false;
+    physical_config.output_root = ToUtf8(fixture.directory.Path() / "physical-build");
+    auto physical = parcel::pack::RunPack(physical_config);
+    REQUIRE(physical);
+    auto physical_manifest =
+        serialize::LoadManifestFile(OutputFile(physical.Value(), "manifest.bytes"), true);
+    REQUIRE(physical_manifest);
+    CHECK(physical_manifest.Value().FindAssetByPath("group-main/" + material_guid.ToHex() +
+                                                    ".prca") != nullptr);
+    const auto physical_texture = std::find_if(
+        physical.Value().report.assets.begin(), physical.Value().report.assets.end(),
+        [&](const parcel::pack::PackAssetReport& asset) { return asset.guid == texture_guid; });
+    REQUIRE(physical_texture != physical.Value().report.assets.end());
+    CHECK(physical_texture->bundle == "shared/group-deps");
+}
+
 TEST_CASE("pack rejects multiple raw assets in one bundle") {
     PackFixture fixture;
     assets::RawFileAsset second_raw;
@@ -506,5 +1190,3 @@ TEST_CASE("pack rejects multiple raw assets in one bundle") {
     REQUIRE_FALSE(result);
     REQUIRE(result.GetError().code == core::ErrorCode::InvalidArgument);
 }
-
-

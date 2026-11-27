@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "parcel/core/guid.hpp"
 #include "parcel/math.hpp"
@@ -28,6 +28,8 @@ inline constexpr ComponentTypeId kScriptComponentType = 12;
 inline constexpr ComponentTypeId kAnimationPlayerComponentType = 13;
 inline constexpr ComponentTypeId kSkinComponentType = 14;
 inline constexpr ComponentTypeId kMorphComponentType = 15;
+inline constexpr ComponentTypeId kAudioSourceMixComponentType = 16;
+inline constexpr ComponentTypeId kAudioReverbZoneComponentType = 17;
 
 inline constexpr std::uint32_t kStandardComponentSchemaVersion = 1;
 inline constexpr std::uint32_t kMaxMorphWeights = 256;
@@ -245,6 +247,40 @@ struct AudioListenerComponent {
     bool enabled = true;
 
     friend bool operator==(const AudioListenerComponent&, const AudioListenerComponent&) = default;
+};
+
+enum class AudioBus : std::uint8_t { Master = 0, Music, Sfx, Voice };
+
+struct AudioSourceMixComponent {
+    AudioBus bus = AudioBus::Sfx;
+    std::int32_t priority = 0;
+    bool occlusion_enabled = false;
+    float occlusion_gain = 0.4f;
+    float occlusion_low_pass_gain = 1.0f;
+    float occlusion_low_pass_gain_high_frequency = 0.25f;
+
+    friend bool operator==(const AudioSourceMixComponent&,
+                           const AudioSourceMixComponent&) = default;
+};
+
+enum class AudioReverbPreset : std::uint8_t {
+    Off = 0,
+    Generic,
+    Room,
+    Hall,
+    Cave,
+    Outdoor,
+};
+
+struct AudioReverbZoneComponent {
+    Vec3 half_extents{1.0f, 1.0f, 1.0f};
+    AudioReverbPreset preset = AudioReverbPreset::Generic;
+    std::int32_t priority = 0;
+    float transition_seconds = 0.5f;
+    bool enabled = true;
+
+    friend bool operator==(const AudioReverbZoneComponent&,
+                           const AudioReverbZoneComponent&) = default;
 };
 
 enum class MotionType : std::uint8_t { Static, Kinematic, Dynamic };

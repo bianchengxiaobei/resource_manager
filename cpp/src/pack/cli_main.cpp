@@ -22,12 +22,14 @@ void PrintHelp() {
               << "  parcel_pack --project <dir> --cooked <dir> --output <dir> "
                  "--package <name> --version <version> [options]\n\n"
               << "Options:\n"
-              << "  --config <file>       JSON collector/build configuration\n"
+              << "  --config <file>       JSON or TOML collector/build configuration\n"
+              << "  --source <dir>        Source tree for .parcelmeta mapping (default: project)\n"
               << "  --target <name>       Target platform (default: windows)\n"
               << "  --jobs <count>        Worker count hint (default: 1)\n"
               << "  --compression <name>  none, lz4 or zstd\n"
               << "  --block-size <bytes>  PRCL block size\n"
               << "  --clean               Remove stale bundle files\n"
+              << "  --verify-output       Verify written manifest/bundle/version/catalog\n"
               << "  --help                Show this help\n";
 }
 
@@ -72,6 +74,7 @@ int main(int argc, char** argv) {
     bool compression_set = false;
     bool block_size_set = false;
     bool jobs_set = false;
+    bool verify_output_set = false;
 
     auto next_value = [&](int& index, std::string_view option) -> std::string {
         if (index + 1 >= argc) {
@@ -106,6 +109,10 @@ int main(int argc, char** argv) {
         } else if (arg == "--target") {
             config.target = next_value(i, arg);
             target_set = true;
+        } else if (StartsWith(arg, "--source=")) {
+            config.source_root = std::string(arg.substr(9));
+        } else if (arg == "--source") {
+            config.source_root = next_value(i, arg);
         } else if (StartsWith(arg, "--cooked=")) {
             config.cooked_root = std::string(arg.substr(9));
         } else if (arg == "--cooked") {
@@ -168,6 +175,9 @@ int main(int argc, char** argv) {
             block_size_set = true;
         } else if (arg == "--clean") {
             config.clean_output = true;
+        } else if (arg == "--verify-output") {
+            config.verify_output_hashes = true;
+            verify_output_set = true;
         } else {
             std::cerr << "unknown argument: " << arg << "\n";
             PrintHelp();
@@ -199,6 +209,9 @@ int main(int argc, char** argv) {
         if (config.target == "windows" && !target_set) {
             config.target = std::move(from_file.target);
         }
+        if (config.source_root.empty()) {
+            config.source_root = std::move(from_file.source_root);
+        }
         if (config.cooked_root.empty()) {
             config.cooked_root = std::move(from_file.cooked_root);
         }
@@ -220,10 +233,16 @@ int main(int argc, char** argv) {
         config.location_to_lower = from_file.location_to_lower;
         config.include_asset_guid = from_file.include_asset_guid;
         config.replace_asset_path_with_address = from_file.replace_asset_path_with_address;
+        config.use_source_path = from_file.use_source_path;
+        config.force_sub_asset_grouping = from_file.force_sub_asset_grouping;
         config.auto_collect_shaders = from_file.auto_collect_shaders;
+        config.write_builtin_catalog = from_file.write_builtin_catalog;
         config.enable_share_bundle = from_file.enable_share_bundle;
         config.single_referenced_pack_alone = from_file.single_referenced_pack_alone;
         config.clean_output = config.clean_output || from_file.clean_output;
+        if (!verify_output_set) {
+            config.verify_output_hashes = from_file.verify_output_hashes;
+        }
         config.output_name_style = from_file.output_name_style;
         config.build_bundle_type = from_file.build_bundle_type;
         config.collectors = std::move(from_file.collectors);
@@ -248,6 +267,9 @@ int main(int argc, char** argv) {
     std::cout << "packed " << report.asset_count << " assets into " << report.bundle_count
               << " bundles (" << report.reused_bundle_count << " reused), "
               << report.total_bundle_bytes << " bytes\n";
+    if (report.output_verified) {
+        std::cout << "verified " << report.verified_bundle_count << " bundles\n";
+    }
     std::cout << "output: " << summary.Value().output_directory << "\n";
     std::cout << "report: " << summary.Value().output_directory << "/build_report.json\n";
     return 0;

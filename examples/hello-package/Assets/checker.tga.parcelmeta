@@ -2,7 +2,7 @@
   "version": 1,
   "sourceGuid": "710d94a6a712d0ebf272b5b659947b99",
   "importer": "texture",
-  "importerVersion": 1,
+  "importerVersion": 3,
   "sourceHash": "sha256:d6b6f2fa7c430f36ec1c0e6ec01823ad217f1c26d510fbb6d305be6ffcb496cf",
   "settingsHash": "sha256:3bca6054e25cd8547040e4fc94e2847950c2d3648019e67da80000163af6e307",
   "settings": {
@@ -16,7 +16,7 @@
   },
   "assets": [
     {
-      "guid": "d230091d7b66ee3e38633cce9f38bd9a",
+      "guid": "2ff92e2ec84b25de7a3f690b4722c637",
       "type": "TextureAsset",
       "role": "texture",
       "localId": "texture"

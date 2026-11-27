@@ -126,13 +126,18 @@ struct TextureResolver {
             const assets::JsonValue texture_settings =
                 MakeDefaultImportSettings("texture", target);
             auto decoded = DecodeTextureAsset(bytes, texture_settings, source_label);
-            if (!decoded) {
+            if (decoded) {
+                cooked_texture = std::move(decoded).Value();
+            } else if (request.texture_decode_fallback != nullptr) {
+                cooked_texture = request.texture_decode_fallback(
+                    begin, bytes.size(), request.texture_decode_user);
+            }
+            if (cooked_texture == nullptr) {
                 warnings.push_back("failed to decode embedded texture '" + std::string(text) +
                                    "': " + decoded.GetError().ToString());
                 embedded_cache.emplace(texture, core::AssetGuid{});
                 return {};
             }
-            cooked_texture = std::move(decoded).Value();
         } else {
             constexpr std::size_t kMaxEmbeddedDimension = 16384;
             constexpr std::size_t kMaxEmbeddedPixels = 64ull * 1000ull * 1000ull;
@@ -1082,13 +1087,27 @@ class FbxImporter final : public IAssetImporter {
                     component.type = scene::LightType::Area;
                     break;
                 }
-                component.color = {light->mColorDiffuse.r, light->mColorDiffuse.g,
-                                   light->mColorDiffuse.b};
-                component.intensity =
+                const float intensity =
                     std::max(light->mColorDiffuse.r,
                              std::max(light->mColorDiffuse.g, light->mColorDiffuse.b));
-                component.inner_cone_angle = light->mAngleInnerCone;
-                component.outer_cone_angle = light->mAngleOuterCone;
+                component.intensity = intensity;
+                if (intensity > 1.0e-8f) {
+                    component.color = {light->mColorDiffuse.r / intensity,
+                                       light->mColorDiffuse.g / intensity,
+                                       light->mColorDiffuse.b / intensity};
+                } else {
+                    component.color = {0.0f, 0.0f, 0.0f};
+                }
+                component.inner_cone_angle = light->mAngleInnerCone * 0.5f;
+                component.outer_cone_angle = light->mAngleOuterCone * 0.5f;
+                if (component.type == scene::LightType::Area) {
+                    if (light->mSize.x > 0.0f) {
+                        component.area_width = light->mSize.x;
+                    }
+                    if (light->mSize.y > 0.0f) {
+                        component.area_height = light->mSize.y;
+                    }
+                }
                 PARCEL_TRY(AddComponent(scene_asset->scene, id, component));
             }
         }

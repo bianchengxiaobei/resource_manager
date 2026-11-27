@@ -1,4 +1,4 @@
-﻿#include <catch_amalgamated.hpp>
+#include <catch_amalgamated.hpp>
 
 #include "parcel/core/guid.hpp"
 #include "parcel/core/hash.hpp"
@@ -10,12 +10,14 @@
 #include "test_util.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -246,9 +248,8 @@ class FlakyCommitSandbox final : public runtime::SandboxFileSystem {
 
     void FailCommits(int count) { fail_commits_.store(count, std::memory_order_release); }
 
-    core::Result<void>
-    CommitDownloadedBundle(const serialize::ManifestBundleView& bundle,
-                           std::string_view temp_path) override {
+    core::Result<void> CommitDownloadedBundle(const serialize::ManifestBundleView& bundle,
+                                              std::string_view temp_path) override {
         if (fail_commits_.load(std::memory_order_acquire) > 0) {
             fail_commits_.fetch_sub(1, std::memory_order_acq_rel);
             return core::MakeError(core::ErrorCode::Io, "injected disk full");
@@ -259,7 +260,6 @@ class FlakyCommitSandbox final : public runtime::SandboxFileSystem {
   private:
     std::atomic<int> fail_commits_{0};
 };
-
 
 class TestUrlProvider final : public runtime::IDownloadUrlProvider {
   public:
@@ -313,8 +313,7 @@ class TestUrlProvider final : public runtime::IDownloadUrlProvider {
 
 class MappedUrlProvider final : public runtime::IDownloadUrlProvider {
   public:
-    explicit MappedUrlProvider(std::map<std::string, std::string> urls)
-        : urls_(std::move(urls)) {}
+    explicit MappedUrlProvider(std::map<std::string, std::string> urls) : urls_(std::move(urls)) {}
 
     core::Result<std::vector<std::string>>
     GetUrls(const runtime::DownloadUrlRequest& request) override {
@@ -352,10 +351,11 @@ struct PackageFixture {
     AssetGuid bundle_guid;
     std::string bundle_name = "main";
 
-    PackageFixture() {
+    explicit PackageFixture(ByteVector seed = {}) {
         bundle_guid = GuidFrom("main-bundle");
         bundle_file = bundle_guid.ToHex() + ".bundle";
-        bundle_bytes = Bytes("fake-bundle-payload-for-remote-test");
+        bundle_bytes =
+            seed.empty() ? Bytes("fake-bundle-payload-for-remote-test") : std::move(seed);
         manifest.package_name = "game";
         manifest.package_version = "1.0.0";
         serialize::ManifestBundleDesc bundle;
@@ -380,10 +380,14 @@ struct PackageFixture {
     };
 
     ExtraBundle AddBundle(std::string_view name) {
+        return AddBundle(name, Bytes("fake-bundle-payload-for-remote-test:" + std::string(name)));
+    }
+
+    ExtraBundle AddBundle(std::string_view name, ByteVector bytes) {
         ExtraBundle extra;
         extra.guid = GuidFrom(name);
         extra.file_name = extra.guid.ToHex() + ".bundle";
-        extra.bytes = Bytes("fake-bundle-payload-for-remote-test:" + std::string(name));
+        extra.bytes = std::move(bytes);
         serialize::ManifestBundleDesc bundle;
         bundle.bundle_guid = extra.guid;
         bundle.bundle_name = std::string(name);
@@ -392,13 +396,12 @@ struct PackageFixture {
         bundle.file_sha256 = core::Sha256(extra.bytes);
         bundle.file_crc = core::Crc32(extra.bytes);
         manifest.bundles.push_back(std::move(bundle));
-        auto bytes = serialize::WriteManifest(manifest);
-        REQUIRE(bytes);
-        manifest_bytes = std::move(bytes).Value();
+        auto manifest_result = serialize::WriteManifest(manifest);
+        REQUIRE(manifest_result);
+        manifest_bytes = std::move(manifest_result).Value();
         WriteFile(builtin / "manifest.bytes", manifest_bytes);
         return extra;
     }
-
 
     runtime::ResourcePackageOptions
     Options(std::shared_ptr<runtime::IHttpTransport> transport,
@@ -517,8 +520,9 @@ TEST_CASE("signed URL provider caches and refreshes server signatures", "[remote
     const std::string sign_url = "https://api.test/api/v1/client/url";
     const std::string signed_path = "/files/game/1.0.0/" + fixture.bundle_file;
     const auto expires = FutureUnixSeconds();
-    const std::string signed_url = "https://cdn.test" + signed_path + "?expires=" +
-                                   std::to_string(expires) + "&key_id=k1&signature=sig";
+    const std::string signed_url = "https://cdn.test" + signed_path +
+                                   "?expires=" + std::to_string(expires) +
+                                   "&key_id=k1&signature=sig";
     const std::string sign_request = SignRequestUrl(sign_url, signed_path);
     const std::string sign_body =
         R"({"url":")" + signed_url + R"(","expires":)" + std::to_string(expires) + "}";
@@ -527,8 +531,7 @@ TEST_CASE("signed URL provider caches and refreshes server signatures", "[remote
 
     auto auth = std::make_shared<remote::StaticAuthProvider>("Authorization", "Bearer token");
     remote::SignedUrlProvider provider(
-        sign_url,
-        {"https://cdn-a.test/files/game/1.0.0", "https://cdn-b.test/files/game/1.0.0"},
+        sign_url, {"https://cdn-a.test/files/game/1.0.0", "https://cdn-b.test/files/game/1.0.0"},
         transport, auth);
     remote::RemoteRequestContext context;
     context.package = "game";
@@ -539,10 +542,10 @@ TEST_CASE("signed URL provider caches and refreshes server signatures", "[remote
     REQUIRE(urls);
     REQUIRE(urls.Value().size() == 2);
     const std::string query = signed_url.substr(signed_url.find('?'));
-    REQUIRE(urls.Value()[0] == "https://cdn-a.test/files/game/1.0.0/" + fixture.bundle_file +
-                                   query);
-    REQUIRE(urls.Value()[1] == "https://cdn-b.test/files/game/1.0.0/" + fixture.bundle_file +
-                                   query);
+    REQUIRE(urls.Value()[0] ==
+            "https://cdn-a.test/files/game/1.0.0/" + fixture.bundle_file + query);
+    REQUIRE(urls.Value()[1] ==
+            "https://cdn-b.test/files/game/1.0.0/" + fixture.bundle_file + query);
     REQUIRE(transport->Requests().size() == 1);
     REQUIRE(HeaderValue(transport->Requests()[0], "Authorization") == "Bearer token");
 
@@ -563,8 +566,8 @@ TEST_CASE("signed URL downloader re-signs after a forbidden response", "[remote]
     const std::string sign_url = "https://api.test/api/v1/client/url";
     const std::string signed_path = "/files/game/1.0.0/" + fixture.bundle_file;
     const auto expires = FutureUnixSeconds();
-    const std::string file_url = "https://cdn.test" + signed_path + "?expires=" +
-                                 std::to_string(expires) + "&key_id=k1&signature=sig";
+    const std::string file_url = "https://cdn.test" + signed_path +
+                                 "?expires=" + std::to_string(expires) + "&key_id=k1&signature=sig";
     const std::string sign_request = SignRequestUrl(sign_url, signed_path);
     const std::string sign_body =
         R"({"url":")" + file_url + R"(","expires":)" + std::to_string(expires) + "}";
@@ -711,7 +714,6 @@ TEST_CASE("remote cache verification leaves missing bundles downloadable", "[rem
     system.Shutdown();
 }
 
-
 TEST_CASE("remote cache verification continues across corrupt and missing bundles", "[remote]") {
     PackageFixture fixture;
     const auto extra = fixture.AddBundle("side");
@@ -720,8 +722,8 @@ TEST_CASE("remote cache verification continues across corrupt and missing bundle
     auto transport = std::make_shared<MockTransport>();
     transport->Set(first_url, fixture.bundle_bytes);
     transport->Set(extra_url, extra.bytes);
-    auto provider = std::make_shared<TestUrlProvider>(
-        std::vector<std::string>{first_url, extra_url});
+    auto provider =
+        std::make_shared<TestUrlProvider>(std::vector<std::string>{first_url, extra_url});
 
     runtime::AssetSystem system;
     REQUIRE(system.Initialize({}));
@@ -760,7 +762,6 @@ TEST_CASE("remote cache verification continues across corrupt and missing bundle
     REQUIRE(system.DestroyPackage("game"));
     system.Shutdown();
 }
-
 
 TEST_CASE("remote cache verification matches serial and concurrent reports", "[remote]") {
     PackageFixture fixture;
@@ -864,6 +865,324 @@ TEST_CASE("remote WinHTTP downloads a bundle from a loopback server", "[.winhttp
     REQUIRE(system.DestroyPackage("game"));
     system.Shutdown();
 }
+
+TEST_CASE("remote WinHTTP large download benchmark", "[.download-bench]") {
+    const char* base_env = std::getenv("PARCEL_DOWNLOAD_BENCH_BASE_URL");
+    const char* fixture_env = std::getenv("PARCEL_DOWNLOAD_BENCH_FIXTURE_DIR");
+    if (base_env == nullptr || fixture_env == nullptr) {
+        SKIP("download benchmark environment is not configured");
+    }
+    const std::string base = base_env;
+    const std::filesystem::path fixture_root = fixture_env;
+    const char* count_env = std::getenv("PARCEL_DOWNLOAD_BENCH_COUNT");
+    const char* bytes_env = std::getenv("PARCEL_DOWNLOAD_BENCH_BYTES");
+    const char* concurrency_env = std::getenv("PARCEL_DOWNLOAD_BENCH_CONCURRENCY");
+    const std::size_t count =
+        count_env ? static_cast<std::size_t>(std::strtoull(count_env, nullptr, 10)) : 512;
+    const std::size_t payload_bytes =
+        bytes_env ? static_cast<std::size_t>(std::strtoull(bytes_env, nullptr, 10)) : 65536;
+    const int concurrency = concurrency_env ? std::atoi(concurrency_env) : 8;
+    REQUIRE(count > 0);
+    REQUIRE(payload_bytes > 0);
+    REQUIRE(concurrency > 0);
+    std::filesystem::create_directories(fixture_root);
+
+    PackageFixture fixture;
+    std::map<std::string, std::string> urls;
+    urls[fixture.bundle_file] = base + "/" + fixture.bundle_file;
+    WriteFile(fixture_root / fixture.bundle_file, fixture.bundle_bytes);
+    for (std::size_t index = 1; index < count; ++index) {
+        ByteVector payload(payload_bytes);
+        for (std::size_t offset = 0; offset < payload.size(); ++offset) {
+            payload[offset] = static_cast<std::byte>((offset * 31U + index) % 251U);
+        }
+        const std::string name = "bench-" + std::to_string(index);
+        auto extra = fixture.AddBundle(name, std::move(payload));
+        WriteFile(fixture_root / extra.file_name, extra.bytes);
+        urls[extra.file_name] = base + "/" + extra.file_name;
+    }
+
+    const std::uint64_t expected_bytes =
+        static_cast<std::uint64_t>(fixture.bundle_bytes.size()) +
+        static_cast<std::uint64_t>(count - 1) * static_cast<std::uint64_t>(payload_bytes);
+    auto transport = std::make_shared<remote::WinHttpTransport>(false);
+    auto provider = std::make_shared<MappedUrlProvider>(std::move(urls));
+
+    runtime::AssetSystem system;
+    REQUIRE(system.Initialize({}));
+    auto options = fixture.Options(transport, provider);
+    options.download_options.max_concurrency = concurrency;
+    options.download_options.max_requests_per_frame = 32;
+    auto package = system.CreatePackage(options);
+    REQUIRE(package);
+    auto downloader = package.Value()->CreateDownloader();
+    REQUIRE(downloader);
+    REQUIRE(downloader.Value()->Summary().total_count == count);
+    REQUIRE(downloader.Value()->TotalBytes() == expected_bytes);
+
+    downloader.Value()->Start();
+    REQUIRE(WaitDownloader(downloader.Value(), std::chrono::seconds(180)));
+    const auto summary = downloader.Value()->Summary();
+    INFO("last error: " << downloader.Value()->LastError().ToString());
+    const double elapsed_seconds = std::max<double>(0.001, summary.elapsed.count() / 1000.0);
+    const double mib_per_second =
+        static_cast<double>(summary.downloaded_bytes) / (1024.0 * 1024.0) / elapsed_seconds;
+    const auto stats = transport->GetStats();
+    std::printf("parcel_download_bench: files=%zu bytes=%llu concurrency=%d elapsed_ms=%lld "
+                "mib_per_second=%.3f requests=%llu created=%llu reused=%llu\n",
+                count, static_cast<unsigned long long>(summary.downloaded_bytes), concurrency,
+                static_cast<long long>(summary.elapsed.count()), mib_per_second,
+                static_cast<unsigned long long>(stats.requests),
+                static_cast<unsigned long long>(stats.connections_created),
+                static_cast<unsigned long long>(stats.connections_reused));
+    std::fflush(stdout);
+    REQUIRE(downloader.Value()->Status() == core::OperationStatus::Succeeded);
+    REQUIRE(summary.completed_count == count);
+    REQUIRE(summary.failed_count == 0);
+    REQUIRE(summary.downloaded_bytes == expected_bytes);
+    REQUIRE(mib_per_second > 0.0);
+    REQUIRE(package.Value()->VerifyCache());
+    REQUIRE(package.Value()->GetDownloadSize() == 0);
+    std::size_t installed = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(fixture.sandbox / "bundles")) {
+        if (entry.is_regular_file() && entry.path().extension() == ".bundle") {
+            ++installed;
+        }
+    }
+    REQUIRE(installed == count);
+
+    REQUIRE(system.DestroyPackage("game"));
+    system.Shutdown();
+}
+
+TEST_CASE("remote WinHTTP downloads from a public CDN over TLS", "[.cdn]") {
+    const char* url_env = std::getenv("PARCEL_CDN_URL");
+    const char* bytes_env = std::getenv("PARCEL_CDN_EXPECTED_BYTES");
+    if (url_env == nullptr || bytes_env == nullptr) {
+        SKIP("CDN environment is not configured");
+    }
+    const std::string url = url_env;
+    const std::uint64_t expected_bytes = std::strtoull(bytes_env, nullptr, 10);
+    REQUIRE(url.starts_with("https://"));
+    REQUIRE(expected_bytes > 0);
+
+    auto transport = std::make_shared<remote::WinHttpTransport>(false);
+    std::array<double, 2> elapsed_seconds{};
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        runtime::HttpRequest request;
+        request.url = url;
+        request.timeout = std::chrono::seconds(60);
+        const auto started = std::chrono::steady_clock::now();
+        auto response = transport->Send(request);
+        elapsed_seconds[attempt] =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        if (!response) {
+            INFO(response.GetError().ToString());
+            FAIL("CDN request failed");
+        }
+        INFO("HTTP status " << response.Value().status);
+        REQUIRE(response.Value().IsSuccess());
+        REQUIRE(static_cast<std::uint64_t>(response.Value().body.size()) == expected_bytes);
+    }
+
+    const auto stats = transport->GetStats();
+    const double mib = static_cast<double>(expected_bytes) / (1024.0 * 1024.0);
+    std::printf("parcel_cdn: url=%s bytes=%llu cold_ms=%.1f cold_MiBps=%.2f "
+                "warm_ms=%.1f warm_MiBps=%.2f requests=%llu created=%llu reused=%llu\n",
+                url.c_str(), static_cast<unsigned long long>(expected_bytes),
+                elapsed_seconds[0] * 1000.0, mib / elapsed_seconds[0], elapsed_seconds[1] * 1000.0,
+                mib / elapsed_seconds[1], static_cast<unsigned long long>(stats.requests),
+                static_cast<unsigned long long>(stats.connections_created),
+                static_cast<unsigned long long>(stats.connections_reused));
+    std::fflush(stdout);
+    REQUIRE(stats.requests == 2);
+    REQUIRE(stats.connections_created >= 1);
+    REQUIRE(stats.connections_reused >= 1);
+}
+
+TEST_CASE("remote WinHTTP installs a bundle from a real CDN over TLS", "[.cdn-install]") {
+    const char* url_env = std::getenv("PARCEL_CDN_BUNDLE_URL");
+    if (url_env == nullptr) {
+        SKIP("CDN bundle environment is not configured");
+    }
+    const std::string url = url_env;
+    REQUIRE(url.starts_with("https://"));
+
+    auto transport = std::make_shared<remote::WinHttpTransport>(false);
+    runtime::HttpRequest request;
+    request.url = url;
+    request.timeout = std::chrono::seconds(60);
+    auto remote = transport->Send(request);
+    if (!remote) {
+        INFO(remote.GetError().ToString());
+        FAIL("CDN bundle preflight failed");
+    }
+    INFO("HTTP status " << remote.Value().status);
+    REQUIRE(remote.Value().IsSuccess());
+    REQUIRE(!remote.Value().body.empty());
+
+    PackageFixture fixture(remote.Value().body);
+    auto provider = std::make_shared<TestUrlProvider>(std::vector<std::string>{url});
+    runtime::AssetSystem system;
+    REQUIRE(system.Initialize({}));
+    auto package = system.CreatePackage(fixture.Options(transport, provider));
+    REQUIRE(package);
+    auto downloader = package.Value()->CreateDownloader();
+    REQUIRE(downloader);
+    REQUIRE(downloader.Value()->Summary().total_count == 1);
+    downloader.Value()->Start();
+    REQUIRE(WaitDownloader(downloader.Value()));
+    INFO(downloader.Value()->LastError().ToString());
+    REQUIRE(downloader.Value()->Status() == core::OperationStatus::Succeeded);
+
+    const auto installed = fixture.sandbox / "bundles" / fixture.bundle_file;
+    REQUIRE(std::filesystem::exists(installed));
+    REQUIRE(ReadFile(installed) == fixture.bundle_bytes);
+    REQUIRE(package.Value()->VerifyCache());
+    REQUIRE(package.Value()->GetDownloadSize() == 0);
+
+    const auto stats = transport->GetStats();
+    std::printf("parcel_cdn_install: url=%s bytes=%zu requests=%llu created=%llu reused=%llu\n",
+                url.c_str(), fixture.bundle_bytes.size(),
+                static_cast<unsigned long long>(stats.requests),
+                static_cast<unsigned long long>(stats.connections_created),
+                static_cast<unsigned long long>(stats.connections_reused));
+    std::fflush(stdout);
+    REQUIRE(stats.requests >= 2);
+    REQUIRE(stats.connections_created >= 1);
+    REQUIRE(stats.connections_reused >= 1);
+
+    REQUIRE(system.DestroyPackage("game"));
+    system.Shutdown();
+}
+
+TEST_CASE("remote WinHTTP downloads through a live server signed URL", "[.signed]") {
+    const char* endpoint_env = std::getenv("PARCEL_SIGNED_URL_ENDPOINT");
+    const char* token_env = std::getenv("PARCEL_SIGNED_URL_TOKEN");
+    const char* package_env = std::getenv("PARCEL_SIGNED_URL_PACKAGE");
+    const char* version_env = std::getenv("PARCEL_SIGNED_URL_VERSION");
+    const char* bundle_env = std::getenv("PARCEL_SIGNED_URL_BUNDLE");
+    const char* size_env = std::getenv("PARCEL_SIGNED_URL_EXPECTED_SIZE");
+    const char* sha_env = std::getenv("PARCEL_SIGNED_URL_EXPECTED_SHA256");
+    if (endpoint_env == nullptr || token_env == nullptr || package_env == nullptr ||
+        version_env == nullptr || bundle_env == nullptr || size_env == nullptr ||
+        sha_env == nullptr) {
+        SKIP("live signed URL environment is not configured");
+    }
+    const std::string endpoint = endpoint_env;
+    const std::string token = token_env;
+    const std::string package_name = package_env;
+    const std::string version = version_env;
+    const std::string bundle_name = bundle_env;
+    const std::string expected_sha = sha_env;
+    const std::uint64_t expected_size = std::strtoull(size_env, nullptr, 10);
+    REQUIRE((endpoint.starts_with("http://") || endpoint.starts_with("https://")));
+    REQUIRE(!token.empty());
+    REQUIRE(!package_name.empty());
+    REQUIRE(!version.empty());
+    REQUIRE(!bundle_name.empty());
+    REQUIRE(expected_size > 0);
+    REQUIRE(expected_sha.size() == 64);
+
+    const std::string signed_path =
+        "/files/" + package_name + "/" + version + "/bundles/" + bundle_name;
+    auto transport = std::make_shared<remote::WinHttpTransport>(false);
+    auto auth = std::make_shared<remote::StaticAuthProvider>("Authorization", "Bearer " + token);
+    auto provider = std::make_shared<remote::SignedUrlProvider>(
+        endpoint, std::vector<std::string>{}, transport, auth);
+
+    remote::RemoteRequestContext context;
+    context.package = package_name;
+    context.version = version;
+    context.file_name = "bundles/" + bundle_name;
+    auto urls = provider->GetUrls(context);
+    if (!urls) {
+        INFO(urls.GetError().ToString());
+        FAIL("signed URL request failed");
+    }
+    REQUIRE(urls.Value().size() == 1);
+    const std::string signed_url = urls.Value().front();
+    REQUIRE(signed_url.starts_with("http"));
+    REQUIRE(signed_url.find("/files/") != std::string::npos);
+    REQUIRE(signed_url.find("expires=") != std::string::npos);
+    REQUIRE(signed_url.find("key_id=") != std::string::npos);
+    REQUIRE(signed_url.find("signature=") != std::string::npos);
+
+    runtime::HttpRequest request;
+    request.url = signed_url;
+    request.timeout = std::chrono::seconds(60);
+    auto response = transport->Send(request);
+    if (!response) {
+        INFO(response.GetError().ToString());
+        FAIL("signed download failed");
+    }
+    INFO("HTTP status " << response.Value().status);
+    REQUIRE(response.Value().IsSuccess());
+    REQUIRE(static_cast<std::uint64_t>(response.Value().body.size()) == expected_size);
+    const auto actual_sha = core::Sha256(
+        std::span<const std::byte>(response.Value().body.data(), response.Value().body.size()));
+    REQUIRE(actual_sha.ToHex() == expected_sha);
+
+    const auto query_position = signed_url.find('?');
+    REQUIRE(query_position != std::string::npos);
+    const std::string unsigned_url = signed_url.substr(0, query_position);
+    runtime::HttpRequest unsigned_request;
+    unsigned_request.url = unsigned_url;
+    unsigned_request.timeout = std::chrono::seconds(30);
+    auto unsigned_response = transport->Send(unsigned_request);
+    REQUIRE(unsigned_response);
+    REQUIRE(unsigned_response.Value().status == 403);
+
+    std::string tampered_url = signed_url;
+    const auto signature_position = tampered_url.find("signature=");
+    REQUIRE(signature_position != std::string::npos);
+    const auto signature_start = signature_position + std::strlen("signature=");
+    REQUIRE(signature_start < tampered_url.size());
+    tampered_url[signature_start] = tampered_url[signature_start] == 'A' ? 'B' : 'A';
+    runtime::HttpRequest tampered_request;
+    tampered_request.url = tampered_url;
+    tampered_request.timeout = std::chrono::seconds(30);
+    auto tampered_response = transport->Send(tampered_request);
+    REQUIRE(tampered_response);
+    REQUIRE(tampered_response.Value().status == 403);
+
+    runtime::HttpRequest unauthenticated_request;
+    unauthenticated_request.url = SignRequestUrl(endpoint, signed_path);
+    unauthenticated_request.timeout = std::chrono::seconds(30);
+    auto unauthenticated_response = transport->Send(unauthenticated_request);
+    REQUIRE(unauthenticated_response);
+    REQUIRE(unauthenticated_response.Value().status == 401);
+
+    const auto expires_position = signed_url.find("expires=");
+    REQUIRE(expires_position != std::string::npos);
+    const auto expires_start = expires_position + std::strlen("expires=");
+    const auto expires_end = signed_url.find('&', expires_start);
+    REQUIRE(expires_end != std::string::npos);
+    const auto expires = std::stoll(signed_url.substr(expires_start, expires_end - expires_start));
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    if (expires > now) {
+        std::this_thread::sleep_for(std::chrono::seconds(expires - now + 1));
+    }
+    runtime::HttpRequest expired_request;
+    expired_request.url = signed_url;
+    expired_request.timeout = std::chrono::seconds(30);
+    auto expired_response = transport->Send(expired_request);
+    REQUIRE(expired_response);
+    REQUIRE(expired_response.Value().status == 403);
+
+    const auto stats = transport->GetStats();
+    std::printf("parcel_signed: endpoint=%s bytes=%llu requests=%llu created=%llu reused=%llu\n",
+                endpoint.c_str(), static_cast<unsigned long long>(expected_size),
+                static_cast<unsigned long long>(stats.requests),
+                static_cast<unsigned long long>(stats.connections_created),
+                static_cast<unsigned long long>(stats.connections_reused));
+    std::fflush(stdout);
+    REQUIRE(stats.requests >= 6);
+    REQUIRE(stats.connections_created >= 1);
+    REQUIRE(stats.connections_reused >= 1);
+}
 #endif
 
 TEST_CASE("remote downloader retries injected disk-full commits", "[remote]") {
@@ -935,7 +1254,6 @@ TEST_CASE("remote downloader retries injected disk-full commits", "[remote]") {
     REQUIRE(system.DestroyPackage("game"));
     system.Shutdown();
 }
-
 
 TEST_CASE("remote downloader resumes with Range and retries transport failures", "[remote]") {
     PackageFixture fixture;
@@ -1415,9 +1733,10 @@ TEST_CASE("remote downloader RetryFailed skips succeeded bundles", "[remote]") {
     REQUIRE(std::filesystem::exists(side_installed));
 
     const auto after = transport->Requests();
-    const auto main_requests_after = static_cast<std::size_t>(std::count_if(
-        after.begin(), after.end(),
-        [&main_url](const runtime::HttpRequest& request) { return request.url == main_url; }));
+    const auto main_requests_after = static_cast<std::size_t>(
+        std::count_if(after.begin(), after.end(), [&main_url](const runtime::HttpRequest& request) {
+            return request.url == main_url;
+        }));
     REQUIRE(main_requests_after == main_requests);
 
     REQUIRE(system.DestroyPackage("game"));
@@ -1663,15 +1982,3 @@ TEST_CASE("remote config rejects malformed values", "[remote]") {
                 .Value() == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     REQUIRE_FALSE(remote::NormalizeManifestHash("sha256:not-a-hash"));
 }
-
-
-
-
-
-
-
-
-
-
-
-

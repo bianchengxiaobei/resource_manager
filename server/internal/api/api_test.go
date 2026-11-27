@@ -681,3 +681,182 @@ func TestRateLimitAPIKeyAndNotFound(t *testing.T) {
 		t.Fatalf("bad signature status %d", badSignature.StatusCode)
 	}
 }
+
+func TestPackageAndVersionRenameDelete(t *testing.T) {
+	env := newTestEnvironmentWith(t, func(cfg *config.Config) {
+		cfg.RequireSignedFiles = false
+	})
+	login := env.login()
+	env.createPackage(login.CSRF, "game")
+	env.upload(login.CSRF, "game", "1.0.0", makeManifest("game", "1.0.0"),
+		map[string][]byte{"one.bundle": makeBundle("one")})
+	env.publish(login.CSRF, "game", "1.0.0")
+
+	env.createPackage(login.CSRF, "taken")
+	conflict := env.adminJSON(http.MethodPatch, "/api/v1/admin/packages/game", login.CSRF,
+		`{"name":"taken"}`)
+	conflict.Body.Close()
+	if conflict.StatusCode != http.StatusConflict {
+		t.Fatalf("package rename conflict status %d", conflict.StatusCode)
+	}
+
+	rename := env.adminJSON(http.MethodPatch, "/api/v1/admin/packages/game", login.CSRF,
+		`{"name":"game2"}`)
+	if rename.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(rename.Body)
+		rename.Body.Close()
+		t.Fatalf("package rename status %d: %s", rename.StatusCode, payload)
+	}
+	pkg := decode[store.Package](t, rename)
+	if pkg.Name != "game2" {
+		t.Fatalf("renamed package = %q", pkg.Name)
+	}
+	oldPackage := env.request(http.MethodGet, "/api/v1/admin/packages/game", nil, nil)
+	oldPackage.Body.Close()
+	if oldPackage.StatusCode != http.StatusNotFound {
+		t.Fatalf("old package status %d", oldPackage.StatusCode)
+	}
+	operator, err := env.store.CreateUser(t.Context(), "operator", "unused", "operator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.store.CreateAPIKey(t.Context(), operator.ID, "operator-cli",
+		secure.HashAPIKey("operator-key"), nil); err != nil {
+		t.Fatal(err)
+	}
+	forbidden := env.request(http.MethodPatch, "/api/v1/admin/packages/game2",
+		strings.NewReader(`{"name":"operator-rename"}`),
+		map[string]string{"Content-Type": "application/json", "X-API-Key": "operator-key"})
+	forbidden.Body.Close()
+	if forbidden.StatusCode != http.StatusForbidden {
+		t.Fatalf("operator rename status %d", forbidden.StatusCode)
+	}
+	if _, err := env.store.ArtifactByName(t.Context(), "game2", "1.0.0", "game2_1.0.0.bytes"); err != nil {
+		t.Fatalf("renamed package manifest artifact: %v", err)
+	}
+	manifestDownload := env.request(http.MethodGet, "/files/game2/1.0.0/game2_1.0.0.bytes", nil, nil)
+	manifestData, _ := io.ReadAll(manifestDownload.Body)
+	manifestDownload.Body.Close()
+	if manifestDownload.StatusCode != http.StatusOK || !bytes.Equal(manifestData, makeManifest("game", "1.0.0")) {
+		t.Fatalf("renamed package manifest status %d", manifestDownload.StatusCode)
+	}
+
+	env.upload(login.CSRF, "game2", "2.0.0", makeManifest("game2", "2.0.0"), nil)
+	versionConflict := env.adminJSON(http.MethodPatch,
+		"/api/v1/admin/packages/game2/versions/1.0.0", login.CSRF, `{"version":"2.0.0"}`)
+	versionConflict.Body.Close()
+	if versionConflict.StatusCode != http.StatusConflict {
+		t.Fatalf("version rename conflict status %d", versionConflict.StatusCode)
+	}
+	renameVersion := env.adminJSON(http.MethodPatch,
+		"/api/v1/admin/packages/game2/versions/1.0.0", login.CSRF, `{"version":"1.1.0"}`)
+	if renameVersion.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(renameVersion.Body)
+		renameVersion.Body.Close()
+		t.Fatalf("version rename status %d: %s", renameVersion.StatusCode, payload)
+	}
+	version := decode[store.Version](t, renameVersion)
+	if version.Version != "1.1.0" {
+		t.Fatalf("renamed version = %q", version.Version)
+	}
+	renamedManifest := env.request(http.MethodGet, "/files/game2/1.1.0/game2_1.1.0.bytes", nil, nil)
+	renamedData, _ := io.ReadAll(renamedManifest.Body)
+	renamedManifest.Body.Close()
+	if renamedManifest.StatusCode != http.StatusOK || !bytes.Equal(renamedData, makeManifest("game", "1.0.0")) {
+		t.Fatalf("renamed version manifest status %d", renamedManifest.StatusCode)
+	}
+	oldVersion := env.request(http.MethodGet, "/files/game2/1.0.0/game2_1.0.0.bytes", nil, nil)
+	oldVersion.Body.Close()
+	if oldVersion.StatusCode != http.StatusNotFound {
+		t.Fatalf("old version status %d", oldVersion.StatusCode)
+	}
+
+	config := decode[clientConfig](t, env.request(http.MethodGet,
+		"/api/v1/client/config?package=game2&channel=prod&platform=windows&player_id=p1&app_version=1.1.0",
+		nil, nil))
+	if config.Version != "1.1.0" {
+		t.Fatalf("renamed version config = %+v", config)
+	}
+
+	referenced := env.adminJSON(http.MethodDelete,
+		"/api/v1/admin/packages/game2/versions/1.1.0?confirm=1.1.0", login.CSRF, "")
+	referenced.Body.Close()
+	if referenced.StatusCode != http.StatusConflict {
+		t.Fatalf("referenced version delete status %d", referenced.StatusCode)
+	}
+	missingConfirm := env.adminJSON(http.MethodDelete,
+		"/api/v1/admin/packages/game2/versions/2.0.0", login.CSRF, "")
+	missingConfirm.Body.Close()
+	if missingConfirm.StatusCode != http.StatusBadRequest {
+		t.Fatalf("missing version confirm status %d", missingConfirm.StatusCode)
+	}
+
+	draft, err := env.store.GetVersion(t.Context(), "game2", "2.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	draftSHAs := make([]string, 0, len(draft.Artifacts))
+	for _, artifact := range draft.Artifacts {
+		draftSHAs = append(draftSHAs, artifact.SHA256)
+	}
+	deletedVersion := env.adminJSON(http.MethodDelete,
+		"/api/v1/admin/packages/game2/versions/2.0.0?confirm=2.0.0", login.CSRF, "")
+	deletedVersion.Body.Close()
+	if deletedVersion.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete version status %d", deletedVersion.StatusCode)
+	}
+	goneVersion := env.request(http.MethodGet, "/api/v1/admin/packages/game2/versions/2.0.0", nil, nil)
+	goneVersion.Body.Close()
+	if goneVersion.StatusCode != http.StatusNotFound {
+		t.Fatalf("deleted version status %d", goneVersion.StatusCode)
+	}
+	for _, sha := range draftSHAs {
+		if env.server.blobs.Has(sha) {
+			t.Fatalf("deleted version blob still exists: %s", sha)
+		}
+	}
+
+	active, err := env.store.GetVersion(t.Context(), "game2", "1.1.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeSHAs := make([]string, 0, len(active.Artifacts))
+	for _, artifact := range active.Artifacts {
+		activeSHAs = append(activeSHAs, artifact.SHA256)
+	}
+	missingPackageConfirm := env.adminJSON(http.MethodDelete,
+		"/api/v1/admin/packages/game2", login.CSRF, "")
+	missingPackageConfirm.Body.Close()
+	if missingPackageConfirm.StatusCode != http.StatusBadRequest {
+		t.Fatalf("missing package confirm status %d", missingPackageConfirm.StatusCode)
+	}
+	deletedPackage := env.adminJSON(http.MethodDelete,
+		"/api/v1/admin/packages/game2?confirm=game2", login.CSRF, "")
+	deletedPackage.Body.Close()
+	if deletedPackage.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete package status %d", deletedPackage.StatusCode)
+	}
+	gonePackage := env.request(http.MethodGet, "/api/v1/admin/packages/game2", nil, nil)
+	gonePackage.Body.Close()
+	if gonePackage.StatusCode != http.StatusNotFound {
+		t.Fatalf("deleted package status %d", gonePackage.StatusCode)
+	}
+	for _, sha := range activeSHAs {
+		if env.server.blobs.Has(sha) {
+			t.Fatalf("deleted package blob still exists: %s", sha)
+		}
+	}
+}
+
+func (e *testEnvironment) adminJSON(method, path, csrf, body string) *http.Response {
+	e.t.Helper()
+	var reader io.Reader
+	if body != "" {
+		reader = strings.NewReader(body)
+	}
+	headers := map[string]string{"X-CSRF-Token": csrf}
+	if body != "" {
+		headers["Content-Type"] = "application/json"
+	}
+	return e.request(method, path, reader, headers)
+}

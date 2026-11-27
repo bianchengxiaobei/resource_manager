@@ -164,7 +164,25 @@ TEST_CASE("standard component codecs round-trip") {
     CheckComponentRoundTrip(parcel::scene::ReflectionProbeComponent{});
     CheckComponentRoundTrip(parcel::scene::LocalFogVolumeComponent{});
     CheckComponentRoundTrip(parcel::scene::AudioSourceComponent{});
+    parcel::scene::AudioSourceMixComponent source_mix;
+    source_mix.bus = parcel::scene::AudioBus::Music;
+    source_mix.priority = 7;
+    source_mix.occlusion_enabled = true;
+    source_mix.occlusion_gain = 0.35f;
+    source_mix.occlusion_low_pass_gain = 0.6f;
+    source_mix.occlusion_low_pass_gain_high_frequency = 0.2f;
+    CheckComponentRoundTrip(source_mix);
+    parcel::scene::AudioReverbZoneComponent reverb_zone;
+    reverb_zone.half_extents = {2.0f, 3.0f, 4.0f};
+    reverb_zone.preset = parcel::scene::AudioReverbPreset::Room;
+    reverb_zone.priority = 3;
+    reverb_zone.transition_seconds = 0.25f;
+    reverb_zone.enabled = false;
+    CheckComponentRoundTrip(reverb_zone);
     CheckComponentRoundTrip(parcel::scene::AudioListenerComponent{});
+    CHECK(StandardComponentRegistry().Find(parcel::scene::kAudioSourceMixComponentType) != nullptr);
+    CHECK(StandardComponentRegistry().Find(parcel::scene::kAudioReverbZoneComponentType) !=
+          nullptr);
     CheckComponentRoundTrip(parcel::scene::RigidBodyComponent{});
     CheckComponentRoundTrip(ColliderComponent{});
     parcel::scene::ScriptComponent script;

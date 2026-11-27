@@ -23,6 +23,15 @@ namespace parcel::runtime {
 
 struct ResourcePackageImpl;
 
+enum class PlayMode : std::uint8_t {
+    Auto,
+    EditorSimulate,
+    Offline,
+    Host,
+};
+
+[[nodiscard]] std::string_view ToString(PlayMode mode) noexcept;
+
 struct CacheVerifyOptions {
     CacheVerifyLevel level = CacheVerifyLevel::Content;
     std::size_t max_concurrency = 8;
@@ -42,6 +51,9 @@ struct CacheVerifyReport {
 struct ResourcePackageOptions {
     std::string package_name;
     std::string package_version;
+    PlayMode play_mode = PlayMode::Auto;
+    std::string simulate_root;
+    std::string simulate_manifest;
     std::string builtin_root;
     std::string sandbox_root;
     std::string custom_root;
@@ -62,6 +74,30 @@ struct ResourcePackageOptions {
 };
 
 class ResourcePackage;
+
+struct RawFileReaderImpl;
+
+// Synchronous logical-range reader for a packaged raw asset. Archive raw data
+// is read from bundle blocks on demand; non-archive raw is retained as one copy.
+// The reader holds a bundle reference until destruction; it is invalid after
+// ResourcePackage::Destroy().
+class RawFileReader final {
+  public:
+    ~RawFileReader();
+
+    RawFileReader(const RawFileReader&) = delete;
+    RawFileReader& operator=(const RawFileReader&) = delete;
+
+    [[nodiscard]] std::uint64_t Size() const noexcept;
+    [[nodiscard]] core::Result<std::vector<std::byte>> Read(std::uint64_t offset,
+                                                            std::uint64_t size) const;
+
+  private:
+    friend struct ResourcePackageImpl;
+    explicit RawFileReader(std::shared_ptr<RawFileReaderImpl> impl) noexcept;
+
+    std::shared_ptr<RawFileReaderImpl> impl_;
+};
 
 class LoadingLock {
   public:
@@ -97,6 +133,7 @@ class ResourcePackage final {
 
     [[nodiscard]] std::string_view Name() const noexcept;
     [[nodiscard]] std::string_view Version() const noexcept;
+    [[nodiscard]] PlayMode GetPlayMode() const noexcept;
     [[nodiscard]] std::string RequestVersion() const { return std::string(Version()); }
     [[nodiscard]] ManifestPtr Manifest() const noexcept;
     [[nodiscard]] std::shared_ptr<FileSystemHost> Host() const noexcept;
@@ -190,6 +227,10 @@ class ResourcePackage final {
         return LoadRawFile(location, priority);
     }
     [[nodiscard]] AssetHandle LoadRawFileAsync(std::string_view location, int priority = 0);
+    // Opens a synchronous range reader for a raw asset. Archive raw assets do
+    // not create a Provider or materialize the complete payload.
+    [[nodiscard]] core::Result<std::shared_ptr<RawFileReader>>
+    OpenRawFile(std::string_view location);
     [[nodiscard]] AssetHandle LoadBundleFile(std::string_view bundle_name);
     [[nodiscard]] AssetHandle LoadBundleFile(const core::AssetGuid& bundle_guid);
     [[nodiscard]] AssetHandle LoadBundleFileAsync(std::string_view bundle_name);
@@ -225,8 +266,10 @@ class ResourcePackage final {
     [[nodiscard]] core::Result<std::shared_ptr<ResourceDownloader>>
     CreateDownloader(std::span<const std::string> locations = {},
                      std::span<const std::string> tags = {});
-    [[nodiscard]] core::Result<std::shared_ptr<ResourceUnpacker>> CreateUnpacker();
-    [[nodiscard]] core::Result<std::shared_ptr<ResourceImporter>> CreateImporter();
+    [[nodiscard]] core::Result<std::shared_ptr<ResourceUnpacker>>
+    CreateUnpacker(const UnpackOptions& options = {});
+    [[nodiscard]] core::Result<std::shared_ptr<ResourceImporter>>
+    CreateImporter(const BundleImportOptions& options = {});
 
     [[nodiscard]] core::Result<void> StartOperation(core::OperationPtr operation);
 
@@ -249,8 +292,3 @@ class ResourcePackage final {
 };
 
 } // namespace parcel::runtime
-
-
-
-
-

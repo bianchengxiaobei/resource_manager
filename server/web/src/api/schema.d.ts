@@ -668,10 +668,71 @@ export interface paths {
         };
         put?: never;
         post?: never;
-        delete?: never;
+        /**
+         * Delete a package and all its versions
+         * @description Requires the admin role and confirm equal to the package name. Unreferenced content-addressed blobs are removed.
+         */
+        delete: {
+            parameters: {
+                query: {
+                    confirm: string;
+                };
+                header?: never;
+                path: {
+                    pkg: components["parameters"]["Pkg"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Deleted */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                400: components["responses"]["Error"];
+                403: components["responses"]["Error"];
+                404: components["responses"]["Error"];
+            };
+        };
         options?: never;
         head?: never;
-        patch?: never;
+        /**
+         * Rename a package
+         * @description Requires the admin role. Manifest and hash artifact names are updated atomically.
+         */
+        patch: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    pkg: components["parameters"]["Pkg"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["RenamePackageRequest"];
+                };
+            };
+            responses: {
+                /** @description Renamed package */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Package"];
+                    };
+                };
+                400: components["responses"]["Error"];
+                403: components["responses"]["Error"];
+                404: components["responses"]["Error"];
+                409: components["responses"]["Error"];
+            };
+        };
         trace?: never;
     };
     "/api/v1/admin/packages/{pkg}/versions": {
@@ -783,10 +844,74 @@ export interface paths {
         };
         put?: never;
         post?: never;
-        delete?: never;
+        /**
+         * Delete an unreferenced version
+         * @description Requires the admin role and confirm equal to the version. Versions referenced by channels or gray rules are rejected.
+         */
+        delete: {
+            parameters: {
+                query: {
+                    confirm: string;
+                };
+                header?: never;
+                path: {
+                    pkg: components["parameters"]["Pkg"];
+                    version: components["parameters"]["Version"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Deleted */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                400: components["responses"]["Error"];
+                403: components["responses"]["Error"];
+                404: components["responses"]["Error"];
+                409: components["responses"]["Error"];
+            };
+        };
         options?: never;
         head?: never;
-        patch?: never;
+        /**
+         * Rename a version
+         * @description Requires the admin role. Manifest and hash artifact names are updated atomically.
+         */
+        patch: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    pkg: components["parameters"]["Pkg"];
+                    version: components["parameters"]["Version"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["RenameVersionRequest"];
+                };
+            };
+            responses: {
+                /** @description Renamed version */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Version"];
+                    };
+                };
+                400: components["responses"]["Error"];
+                403: components["responses"]["Error"];
+                404: components["responses"]["Error"];
+                409: components["responses"]["Error"];
+            };
+        };
         trace?: never;
     };
     "/api/v1/admin/packages/{pkg}/versions/{version}/publish": {
@@ -1141,6 +1266,12 @@ export interface components {
         };
         CreatePackageRequest: {
             name: string;
+        };
+        RenamePackageRequest: {
+            name: string;
+        };
+        RenameVersionRequest: {
+            version: string;
         };
         Package: {
             id: string;

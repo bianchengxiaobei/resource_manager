@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "parcel/core/result.hpp"
 #include "parcel/scene/components.hpp"
@@ -101,6 +101,22 @@ template <> struct ComponentCodec<AudioSourceComponent> {
     static constexpr std::uint32_t schema_version = kStandardComponentSchemaVersion;
     static Result<std::vector<std::byte>> Encode(const AudioSourceComponent& value);
     static Result<AudioSourceComponent> Decode(std::span<const std::byte> payload);
+};
+
+template <> struct ComponentCodec<AudioSourceMixComponent> {
+    static constexpr ComponentTypeId type_id = kAudioSourceMixComponentType;
+    static constexpr std::string_view type_name = "AudioSourceMixComponent";
+    static constexpr std::uint32_t schema_version = kStandardComponentSchemaVersion;
+    static Result<std::vector<std::byte>> Encode(const AudioSourceMixComponent& value);
+    static Result<AudioSourceMixComponent> Decode(std::span<const std::byte> payload);
+};
+
+template <> struct ComponentCodec<AudioReverbZoneComponent> {
+    static constexpr ComponentTypeId type_id = kAudioReverbZoneComponentType;
+    static constexpr std::string_view type_name = "AudioReverbZoneComponent";
+    static constexpr std::uint32_t schema_version = kStandardComponentSchemaVersion;
+    static Result<std::vector<std::byte>> Encode(const AudioReverbZoneComponent& value);
+    static Result<AudioReverbZoneComponent> Decode(std::span<const std::byte> payload);
 };
 
 template <> struct ComponentCodec<AudioListenerComponent> {

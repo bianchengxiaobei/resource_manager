@@ -5,12 +5,16 @@
 #include "parcel/core/path.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
 #include <map>
+#include <random>
 #include <span>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 
@@ -154,16 +158,186 @@ Result<void> WriteBinary(const std::filesystem::path& path, std::span<const std:
     return {};
 }
 
+constexpr std::string_view kBlobDirectoryName = ".blobs";
+std::atomic<std::uint64_t> g_blob_temp_sequence{0};
+
+std::string TempSuffix() {
+    static const std::uint64_t process_nonce = [] {
+        std::random_device random;
+        const auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+        const auto address = reinterpret_cast<std::uintptr_t>(&g_blob_temp_sequence);
+        return (static_cast<std::uint64_t>(random()) << 32U) ^
+               static_cast<std::uint64_t>(random()) ^ static_cast<std::uint64_t>(now) ^
+               static_cast<std::uint64_t>(address);
+    }();
+    return ".tmp." + std::to_string(process_nonce) + "." +
+           std::to_string(g_blob_temp_sequence.fetch_add(1));
+}
+
 Result<void> WriteText(const std::filesystem::path& path, std::string_view text) {
-    std::ofstream file(path, std::ios::binary | std::ios::trunc);
-    if (!file) {
-        return MakeError(ErrorCode::Io, "failed to open shader manifest for writing");
+    std::filesystem::path temporary = path;
+    temporary += TempSuffix();
+    {
+        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+        if (!file) {
+            return MakeError(ErrorCode::Io, "failed to open shader manifest for writing");
+        }
+        file.write(text.data(), static_cast<std::streamsize>(text.size()));
+        if (!file) {
+            std::error_code ignored;
+            std::filesystem::remove(temporary, ignored);
+            return MakeError(ErrorCode::Io, "failed to write shader manifest");
+        }
     }
-    file.write(text.data(), static_cast<std::streamsize>(text.size()));
-    if (!file) {
-        return MakeError(ErrorCode::Io, "failed to write shader manifest");
+
+    std::error_code error;
+    std::filesystem::rename(temporary, path, error);
+    if (!error) {
+        return {};
     }
-    return {};
+    std::error_code size_error;
+    const auto size = std::filesystem::file_size(path, size_error);
+    std::error_code ignored;
+    std::filesystem::remove(temporary, ignored);
+    if (!size_error && size == text.size()) {
+        return {};
+    }
+    return MakeError(ErrorCode::Io, "failed to commit shader manifest");
+}
+
+Result<std::filesystem::path> EnsureBlob(const std::filesystem::path& blobs,
+                                         std::span<const std::byte> data) {
+    const std::filesystem::path blob = blobs / (parcel::core::Sha256(data).ToHex() + ".bin");
+    std::error_code error;
+    if (std::filesystem::exists(blob, error)) {
+        if (error) {
+            return MakeError(ErrorCode::Io, "failed to inspect shader blob");
+        }
+        const auto size = std::filesystem::file_size(blob, error);
+        if (error) {
+            return MakeError(ErrorCode::Io, "failed to inspect shader blob size");
+        }
+        if (size == data.size()) {
+            return blob;
+        }
+        std::filesystem::remove(blob, error);
+        if (error) {
+            return MakeError(ErrorCode::Io, "failed to replace shader blob");
+        }
+    } else if (error) {
+        return MakeError(ErrorCode::Io, "failed to inspect shader blob");
+    }
+
+    std::filesystem::path temporary = blob;
+    temporary += TempSuffix();
+    auto written = WriteBinary(temporary, data);
+    if (!written) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        return std::move(written).TakeError();
+    }
+    std::filesystem::rename(temporary, blob, error);
+    if (error) {
+        std::error_code size_error;
+        const auto size = std::filesystem::file_size(blob, size_error);
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        if (!size_error && size == data.size()) {
+            return blob;
+        }
+        return MakeError(ErrorCode::Io, "failed to commit shader blob");
+    }
+    return blob;
+}
+
+Result<void> MaterializeBlob(const std::filesystem::path& blob, const std::filesystem::path& output,
+                             bool use_hard_links) {
+    std::error_code error;
+    const auto blob_size = std::filesystem::file_size(blob, error);
+    if (error) {
+        return MakeError(ErrorCode::Io, "failed to inspect shader blob size");
+    }
+    const auto output_ready = [&]() {
+        std::error_code equivalent_error;
+        if (std::filesystem::equivalent(blob, output, equivalent_error) && !equivalent_error) {
+            return true;
+        }
+        std::error_code size_error;
+        const auto size = std::filesystem::file_size(output, size_error);
+        return !size_error && size == blob_size;
+    };
+
+    if (std::filesystem::exists(output, error)) {
+        if (error) {
+            return MakeError(ErrorCode::Io, "failed to inspect shader binary");
+        }
+        if (output_ready()) {
+            return {};
+        }
+        std::filesystem::remove(output, error);
+        if (error && !output_ready()) {
+            return MakeError(ErrorCode::Io, "failed to replace shader binary");
+        }
+    } else if (error) {
+        return MakeError(ErrorCode::Io, "failed to inspect shader binary");
+    }
+
+    if (use_hard_links) {
+        std::filesystem::create_hard_link(blob, output, error);
+        if (!error || output_ready()) {
+            return {};
+        }
+    }
+
+    std::filesystem::path temporary = output;
+    temporary += TempSuffix();
+    std::filesystem::copy_file(blob, temporary, std::filesystem::copy_options::overwrite_existing,
+                               error);
+    if (error) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        if (output_ready()) {
+            return {};
+        }
+        return MakeError(ErrorCode::Io, "failed to materialize shader binary");
+    }
+    std::filesystem::rename(temporary, output, error);
+    if (!error) {
+        return {};
+    }
+    std::error_code ignored;
+    std::filesystem::remove(temporary, ignored);
+    if (output_ready()) {
+        return {};
+    }
+    return MakeError(ErrorCode::Io, "failed to materialize shader binary");
+}
+
+void CleanupOrphanBlobs(const std::filesystem::path& blobs) {
+    std::error_code error;
+    std::filesystem::directory_iterator iterator(blobs, error);
+    const std::filesystem::directory_iterator end;
+    while (!error && iterator != end) {
+        const std::filesystem::directory_entry entry = *iterator;
+        iterator.increment(error);
+        if (error) {
+            return;
+        }
+        std::error_code type_error;
+        if (!entry.is_regular_file(type_error) || type_error) {
+            continue;
+        }
+        if (entry.path().filename().string().find(".tmp.") != std::string::npos) {
+            continue;
+        }
+        std::error_code count_error;
+        const auto links = std::filesystem::hard_link_count(entry.path(), count_error);
+        if (count_error || links > 1) {
+            continue;
+        }
+        std::error_code remove_error;
+        std::filesystem::remove(entry.path(), remove_error);
+    }
 }
 
 Result<std::vector<std::byte>> CanonicalBytes(const parcel::assets::ShaderLibraryAsset& asset) {
@@ -225,6 +399,12 @@ ShaderLibraryBootstrap::Materialize(const parcel::assets::ShaderLibraryAsset& as
         return MakeError(ErrorCode::Io, "failed to create shader cache directory");
     }
 
+    const std::filesystem::path blobs = root.parent_path() / std::string(kBlobDirectoryName);
+    std::filesystem::create_directories(blobs, error);
+    if (error) {
+        return MakeError(ErrorCode::Io, "failed to create shader blob directory");
+    }
+
     ShaderMaterialization materialized;
     materialized.root = root;
     materialized.content_hash = hash.Value();
@@ -275,9 +455,13 @@ ShaderLibraryBootstrap::Materialize(const parcel::assets::ShaderLibraryAsset& as
             if (error) {
                 return MakeError(ErrorCode::Io, "failed to create shader binary directory");
             }
-            auto written = WriteBinary(output, pass.data);
-            if (!written) {
-                return std::move(written).TakeError();
+            auto blob = EnsureBlob(blobs, pass.data);
+            if (!blob) {
+                return std::move(blob).TakeError();
+            }
+            auto linked = MaterializeBlob(blob.Value(), output, options.use_hard_links);
+            if (!linked) {
+                return std::move(linked).TakeError();
             }
             materialized.files.push_back(output);
 
@@ -346,8 +530,25 @@ ShaderLibraryBootstrap::Materialize(const parcel::assets::ShaderLibraryAsset& as
                 AppendArray(manifest, values);
                 has_field = true;
             };
+            auto append_string_field = [&](std::string_view key, std::string_view value) {
+                if (has_field) {
+                    manifest += ",";
+                }
+                manifest += "\"";
+                manifest += key;
+                manifest += "\":\"";
+                manifest += JsonEscape(value);
+                manifest += "\"";
+                has_field = true;
+            };
             append_field("fragments", files.fragments);
+            if (files.fragments.size() == 1) {
+                append_string_field("fragment", files.fragments.front());
+            }
             append_field("bufferFragments", files.buffer_fragments);
+            if (files.buffer_fragments.size() == 1) {
+                append_string_field("bufferFragment", files.buffer_fragments.front());
+            }
             if (!files.compute.empty()) {
                 if (has_field) {
                     manifest += ",";
@@ -409,7 +610,11 @@ ShaderLibraryBootstrap::CleanupOldVersions(const ShaderMaterializeOptions& optio
         if (!entry.is_directory()) {
             continue;
         }
-        if (entry.path().filename().string() == keep_hash) {
+        const std::string name = entry.path().filename().string();
+        if (name == kBlobDirectoryName) {
+            continue;
+        }
+        if (name == keep_hash) {
             continue;
         }
         std::filesystem::remove_all(entry.path(), error);
@@ -417,6 +622,17 @@ ShaderLibraryBootstrap::CleanupOldVersions(const ShaderMaterializeOptions& optio
             return MakeError(ErrorCode::Io, "failed to remove old shader cache");
         }
         ++removed;
+    }
+
+    const std::filesystem::path blobs = root / std::string(kBlobDirectoryName);
+    std::error_code blob_error;
+    if (std::filesystem::exists(blobs, blob_error)) {
+        if (blob_error) {
+            return MakeError(ErrorCode::Io, "failed to inspect shader blob cache");
+        }
+        CleanupOrphanBlobs(blobs);
+    } else if (blob_error) {
+        return MakeError(ErrorCode::Io, "failed to inspect shader blob cache");
     }
     return removed;
 }

@@ -231,6 +231,10 @@ uint32 tag_count
 uint32 flags
 ```
 
+Asset flags bit 0 `ArchiveRaw`：该 Main RawFileAsset 的数据位于 Bundle TOC
+`raw_files`，`path` 即 raw 文件名；此时 `payload_id`/`local_object_id` 为 0，
+运行时从 TOC 读取原始 bytes。其他 bit 保留。
+
 ### 4.4 BundleRecord（96B）
 
 ```text

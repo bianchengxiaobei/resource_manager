@@ -173,6 +173,17 @@ func (s *Store) Has(sha string) bool {
 	return err == nil && info.Mode().IsRegular()
 }
 
+func (s *Store) Remove(sha string) error {
+	if !hashPattern.MatchString(sha) {
+		return ErrInvalidHash
+	}
+	err := os.Remove(sPath(s.root, sha))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
 func (s *Store) CleanTemp() error {
 	entries, err := os.ReadDir(s.tmp)
 	if err != nil {

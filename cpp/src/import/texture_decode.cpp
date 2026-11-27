@@ -5,6 +5,7 @@
 #include "texture_encoder.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -26,6 +27,8 @@ bool DimensionsValid(int width, int height) {
     return width > 0 && height > 0 && width <= kMaxDimension && height <= kMaxDimension &&
            static_cast<std::int64_t>(width) * height <= kMaxPixels;
 }
+
+constexpr float kMaxBakeCoordinate = 1.0e7f;
 
 bool BuildByteMips(std::vector<assets::TextureMip>& mips, const stbi_uc* pixels, int width,
                    int height, bool generate_mips) {
@@ -136,11 +139,157 @@ bool BuildFloatMips(std::vector<assets::TextureMip>& mips, const float* pixels, 
     return true;
 }
 
+std::int64_t WrapTexel(std::int64_t index, int size, assets::TextureWrap wrap) noexcept {
+    const std::int64_t dimension = static_cast<std::int64_t>(size);
+    if (dimension <= 1) {
+        return 0;
+    }
+    switch (wrap) {
+    case assets::TextureWrap::Repeat: {
+        std::int64_t wrapped = index % dimension;
+        if (wrapped < 0) {
+            wrapped += dimension;
+        }
+        return wrapped;
+    }
+    case assets::TextureWrap::Mirror: {
+        const std::int64_t period = dimension * 2;
+        std::int64_t wrapped = index % period;
+        if (wrapped < 0) {
+            wrapped += period;
+        }
+        return wrapped < dimension ? wrapped : period - 1 - wrapped;
+    }
+    case assets::TextureWrap::Clamp:
+    default:
+        return std::clamp(index, std::int64_t{0}, dimension - 1);
+    }
+}
+
+void BakeBytePixels(const stbi_uc* source, int width, int height, const TextureBakeOptions& bake,
+                    stbi_uc* output) {
+    const std::size_t source_pitch = static_cast<std::size_t>(width) * 4;
+    const std::size_t output_pitch = source_pitch;
+    const auto fetch = [&](std::int64_t x, std::int64_t y, std::size_t channel) -> float {
+        const std::int64_t source_x = WrapTexel(x, width, bake.wrap_s);
+        const std::int64_t source_y = WrapTexel(y, height, bake.wrap_t);
+        const std::size_t offset = static_cast<std::size_t>(source_y) * source_pitch +
+                                   static_cast<std::size_t>(source_x) * 4 + channel;
+        return static_cast<float>(source[offset]);
+    };
+
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const Vec2 uv{(static_cast<float>(x) + 0.5f) / static_cast<float>(width),
+                          (static_cast<float>(y) + 0.5f) / static_cast<float>(height)};
+            const Vec2 transformed = bake.transform.Apply(uv);
+            const float source_x = transformed.x * static_cast<float>(width) - 0.5f;
+            const float source_y = transformed.y * static_cast<float>(height) - 0.5f;
+            const std::size_t output_offset =
+                static_cast<std::size_t>(y) * output_pitch + static_cast<std::size_t>(x) * 4;
+            if (!std::isfinite(source_x) || !std::isfinite(source_y) ||
+                std::abs(source_x) > kMaxBakeCoordinate ||
+                std::abs(source_y) > kMaxBakeCoordinate) {
+                std::memset(output + output_offset, 0, 4);
+                continue;
+            }
+
+            if (!bake.bilinear) {
+                const auto source_x_index = static_cast<std::int64_t>(std::floor(source_x + 0.5f));
+                const auto source_y_index = static_cast<std::int64_t>(std::floor(source_y + 0.5f));
+                for (std::size_t channel = 0; channel < 4; ++channel) {
+                    const float value = fetch(source_x_index, source_y_index, channel);
+                    output[output_offset + channel] =
+                        static_cast<stbi_uc>(std::clamp(std::lround(value), 0L, 255L));
+                }
+                continue;
+            }
+
+            const auto source_x_index = static_cast<std::int64_t>(std::floor(source_x));
+            const auto source_y_index = static_cast<std::int64_t>(std::floor(source_y));
+            const float fraction_x = source_x - std::floor(source_x);
+            const float fraction_y = source_y - std::floor(source_y);
+            const float bottom_weight = 1.0f - fraction_y;
+            const float right_weight = 1.0f - fraction_x;
+            for (std::size_t channel = 0; channel < 4; ++channel) {
+                const float bottom_left = fetch(source_x_index, source_y_index, channel);
+                const float bottom_right = fetch(source_x_index + 1, source_y_index, channel);
+                const float top_left = fetch(source_x_index, source_y_index + 1, channel);
+                const float top_right = fetch(source_x_index + 1, source_y_index + 1, channel);
+                const float value = bottom_left * right_weight * bottom_weight +
+                                    bottom_right * fraction_x * bottom_weight +
+                                    top_left * right_weight * fraction_y +
+                                    top_right * fraction_x * fraction_y;
+                output[output_offset + channel] =
+                    static_cast<stbi_uc>(std::clamp(std::lround(value), 0L, 255L));
+            }
+        }
+    }
+}
+
+void BakeFloatPixels(const float* source, int width, int height, const TextureBakeOptions& bake,
+                     float* output) {
+    const std::size_t source_pitch = static_cast<std::size_t>(width) * 4;
+    const std::size_t output_pitch = source_pitch;
+    const auto fetch = [&](std::int64_t x, std::int64_t y, std::size_t channel) -> float {
+        const std::int64_t source_x = WrapTexel(x, width, bake.wrap_s);
+        const std::int64_t source_y = WrapTexel(y, height, bake.wrap_t);
+        const std::size_t offset = static_cast<std::size_t>(source_y) * source_pitch +
+                                   static_cast<std::size_t>(source_x) * 4 + channel;
+        return source[offset];
+    };
+
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const Vec2 uv{(static_cast<float>(x) + 0.5f) / static_cast<float>(width),
+                          (static_cast<float>(y) + 0.5f) / static_cast<float>(height)};
+            const Vec2 transformed = bake.transform.Apply(uv);
+            const float source_x = transformed.x * static_cast<float>(width) - 0.5f;
+            const float source_y = transformed.y * static_cast<float>(height) - 0.5f;
+            const std::size_t output_offset =
+                static_cast<std::size_t>(y) * output_pitch + static_cast<std::size_t>(x) * 4;
+            if (!std::isfinite(source_x) || !std::isfinite(source_y) ||
+                std::abs(source_x) > kMaxBakeCoordinate ||
+                std::abs(source_y) > kMaxBakeCoordinate) {
+                std::memset(output + output_offset, 0, 4 * sizeof(float));
+                continue;
+            }
+
+            if (!bake.bilinear) {
+                const auto source_x_index = static_cast<std::int64_t>(std::floor(source_x + 0.5f));
+                const auto source_y_index = static_cast<std::int64_t>(std::floor(source_y + 0.5f));
+                for (std::size_t channel = 0; channel < 4; ++channel) {
+                    output[output_offset + channel] =
+                        fetch(source_x_index, source_y_index, channel);
+                }
+                continue;
+            }
+
+            const auto source_x_index = static_cast<std::int64_t>(std::floor(source_x));
+            const auto source_y_index = static_cast<std::int64_t>(std::floor(source_y));
+            const float fraction_x = source_x - std::floor(source_x);
+            const float fraction_y = source_y - std::floor(source_y);
+            const float bottom_weight = 1.0f - fraction_y;
+            const float right_weight = 1.0f - fraction_x;
+            for (std::size_t channel = 0; channel < 4; ++channel) {
+                const float bottom_left = fetch(source_x_index, source_y_index, channel);
+                const float bottom_right = fetch(source_x_index + 1, source_y_index, channel);
+                const float top_left = fetch(source_x_index, source_y_index + 1, channel);
+                const float top_right = fetch(source_x_index + 1, source_y_index + 1, channel);
+                output[output_offset + channel] = bottom_left * right_weight * bottom_weight +
+                                                  bottom_right * fraction_x * bottom_weight +
+                                                  top_left * right_weight * fraction_y +
+                                                  top_right * fraction_x * fraction_y;
+            }
+        }
+    }
+}
+
 } // namespace
 
 core::Result<std::shared_ptr<assets::TextureAsset>>
 DecodeTextureAsset(std::span<const std::byte> bytes, const assets::JsonValue& settings,
-                   std::string_view source_label) {
+                   std::string_view source_label, const TextureBakeOptions* bake) {
     const auto fail = [&](ErrorCode code, std::string message) {
         core::Error error = MakeError(code, std::move(message));
         if (!source_label.empty()) {
@@ -193,9 +342,26 @@ DecodeTextureAsset(std::span<const std::byte> bytes, const assets::JsonValue& se
                     hdr ? "failed to decode HDR texture" : "failed to decode texture");
     }
 
+    const float* final_float_pixels = float_pixels;
+    const stbi_uc* final_byte_pixels = byte_pixels;
+    std::vector<float> baked_float_pixels;
+    std::vector<stbi_uc> baked_byte_pixels;
+    if (bake != nullptr && !bake->transform.IsIdentity()) {
+        const std::size_t pixel_count = static_cast<std::size_t>(width) * height;
+        if (hdr) {
+            baked_float_pixels.resize(pixel_count * 4);
+            BakeFloatPixels(float_pixels, width, height, *bake, baked_float_pixels.data());
+            final_float_pixels = baked_float_pixels.data();
+        } else {
+            baked_byte_pixels.resize(pixel_count * 4);
+            BakeBytePixels(byte_pixels, width, height, *bake, baked_byte_pixels.data());
+            final_byte_pixels = baked_byte_pixels.data();
+        }
+    }
+
     std::vector<assets::TextureMip> mips;
-    const bool built = hdr ? BuildFloatMips(mips, float_pixels, width, height, generate_mips)
-                           : BuildByteMips(mips, byte_pixels, width, height, generate_mips);
+    const bool built = hdr ? BuildFloatMips(mips, final_float_pixels, width, height, generate_mips)
+                           : BuildByteMips(mips, final_byte_pixels, width, height, generate_mips);
     stbi_image_free(float_pixels);
     stbi_image_free(byte_pixels);
     if (!built) {

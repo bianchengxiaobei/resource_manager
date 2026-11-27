@@ -1,7 +1,8 @@
-﻿#include "parcel/pack/pack.hpp"
+#include "parcel/pack/pack.hpp"
 
 #include "parcel/assets/asset_codec.hpp"
 #include "parcel/assets/json.hpp"
+#include "parcel/assets/raw_file_asset.hpp"
 #include "parcel/assets/serializers.hpp"
 #include "parcel/assets/shader_library_asset.hpp"
 #include "parcel/assets/texture_asset.hpp"
@@ -13,19 +14,26 @@
 #include "parcel/serialize/bundle.hpp"
 #include "parcel/serialize/manifest.hpp"
 
+#include "toml_config.hpp"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
+#include <regex>
 #include <set>
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -38,7 +46,7 @@ using core::MakeError;
 using core::Result;
 
 constexpr std::string_view kPackToolVersion = "0.4.0";
-constexpr std::uint32_t kBuildDBVersion = 1;
+constexpr std::uint32_t kBuildDBVersion = 2;
 
 std::filesystem::path Utf8Path(std::string_view path) {
     return std::filesystem::path(std::u8string(path.begin(), path.end()));
@@ -107,6 +115,20 @@ std::string LowerAscii(std::string_view value) {
     return result;
 }
 
+std::string TrimAsciiWhitespace(std::string_view value) {
+    std::size_t begin = 0;
+    while (begin < value.size() && (value[begin] == ' ' || value[begin] == '\t' ||
+                                    value[begin] == '\r' || value[begin] == '\n')) {
+        ++begin;
+    }
+    std::size_t end = value.size();
+    while (end > begin && (value[end - 1] == ' ' || value[end - 1] == '\t' ||
+                           value[end - 1] == '\r' || value[end - 1] == '\n')) {
+        --end;
+    }
+    return std::string(value.substr(begin, end - begin));
+}
+
 bool HasNul(std::string_view value) { return value.find('\0') != std::string_view::npos; }
 
 bool HasControl(std::string_view value) {
@@ -144,6 +166,26 @@ Result<void> EnsureDirectory(std::string_view path) {
     core::PlatformFile platform;
     PARCEL_TRY(platform.CreateDirectories(path));
     return {};
+}
+
+struct FileStamp {
+    std::uint64_t size = 0;
+    std::int64_t modified_ns = 0;
+};
+
+Result<FileStamp> ReadFileStamp(std::string_view path) {
+    core::PlatformFile platform;
+    PARCEL_TRY_DECL(core::FileStat, stat, platform.Stat(path));
+    if (!stat.exists || stat.is_directory) {
+        return MakeError(ErrorCode::NotFound, "asset file does not exist")
+            .WithPath(std::string(path));
+    }
+    FileStamp value;
+    value.size = stat.size;
+    value.modified_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(stat.modified.time_since_epoch())
+            .count();
+    return value;
 }
 
 Result<std::vector<std::byte>> ReadFileBytes(std::string_view path) {
@@ -256,6 +298,56 @@ Result<std::uint32_t> ReadUInt(const assets::JsonValue& object, std::string_view
     return static_cast<std::uint32_t>(field->number_value);
 }
 
+Result<std::uint64_t> ParseUInt64(std::string_view value) {
+    std::uint64_t parsed = 0;
+    const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
+    if (result.ec != std::errc{} || result.ptr != value.data() + value.size()) {
+        return MakeError(ErrorCode::Corrupt, "invalid unsigned integer");
+    }
+    return parsed;
+}
+
+Result<std::int64_t> ParseInt64(std::string_view value) {
+    std::int64_t parsed = 0;
+    const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
+    if (result.ec != std::errc{} || result.ptr != value.data() + value.size()) {
+        return MakeError(ErrorCode::Corrupt, "invalid integer");
+    }
+    return parsed;
+}
+
+Result<std::uint64_t> ReadUInt64String(const assets::JsonValue& object, std::string_view key,
+                                       std::uint64_t fallback = 0, bool required = false) {
+    const assets::JsonValue* field = FindField(object, key);
+    if (field == nullptr) {
+        if (required) {
+            return MakeError(ErrorCode::Corrupt,
+                             "missing required field '" + std::string(key) + "'");
+        }
+        return fallback;
+    }
+    if (!field->IsString()) {
+        return MakeError(ErrorCode::Corrupt, "field '" + std::string(key) + "' must be a string");
+    }
+    return ParseUInt64(field->string_value);
+}
+
+Result<std::int64_t> ReadInt64String(const assets::JsonValue& object, std::string_view key,
+                                     std::int64_t fallback = 0, bool required = false) {
+    const assets::JsonValue* field = FindField(object, key);
+    if (field == nullptr) {
+        if (required) {
+            return MakeError(ErrorCode::Corrupt,
+                             "missing required field '" + std::string(key) + "'");
+        }
+        return fallback;
+    }
+    if (!field->IsString()) {
+        return MakeError(ErrorCode::Corrupt, "field '" + std::string(key) + "' must be a string");
+    }
+    return ParseInt64(field->string_value);
+}
+
 Result<std::vector<std::string>> ReadStringArray(const assets::JsonValue& object,
                                                  std::string_view key) {
     const assets::JsonValue* field = FindField(object, key);
@@ -314,6 +406,89 @@ Result<AddressRule> ParseAddressRule(std::string_view value) {
                      "unknown address rule '" + std::string(value) + "'");
 }
 
+Result<PackRule> ParsePackRule(std::string_view value) {
+    const std::string lower = LowerAscii(value);
+    if (lower == "default" || lower == "auto" || lower == "none") {
+        return PackRule::Default;
+    }
+    if (lower == "packseparately" || lower == "separately" || lower == "separate") {
+        return PackRule::PackSeparately;
+    }
+    if (lower == "packdirectory" || lower == "directory") {
+        return PackRule::PackDirectory;
+    }
+    if (lower == "packtopdirectory" || lower == "topdirectory" || lower == "top") {
+        return PackRule::PackTopDirectory;
+    }
+    if (lower == "packcollector" || lower == "collector") {
+        return PackRule::PackCollector;
+    }
+    if (lower == "packgroup" || lower == "group") {
+        return PackRule::PackGroup;
+    }
+    if (lower == "packrawfile" || lower == "rawfile" || lower == "raw") {
+        return PackRule::PackRawFile;
+    }
+    if (lower == "packvideofile" || lower == "videofile" || lower == "video") {
+        return PackRule::PackVideoFile;
+    }
+    if (lower == "packshader" || lower == "shader") {
+        return PackRule::PackShader;
+    }
+    if (lower == "packshadervariants" || lower == "shadervariants") {
+        return PackRule::PackShaderVariants;
+    }
+    return MakeError(ErrorCode::InvalidArgument, "unknown pack rule '" + std::string(value) + "'");
+}
+
+Result<FilterRule> ParseFilterRule(std::string_view value) {
+    const std::string lower = LowerAscii(value);
+    if (lower == "collectall" || lower == "all") {
+        return FilterRule::CollectAll;
+    }
+    if (lower == "collectscene" || lower == "scene") {
+        return FilterRule::CollectScene;
+    }
+    if (lower == "collectshader" || lower == "shader") {
+        return FilterRule::CollectShader;
+    }
+    if (lower == "collectraw" || lower == "raw") {
+        return FilterRule::CollectRaw;
+    }
+    if (lower == "collectvideo" || lower == "video") {
+        return FilterRule::CollectVideo;
+    }
+    if (lower == "collecttexture" || lower == "texture") {
+        return FilterRule::CollectTexture;
+    }
+    if (lower == "collectmaterial" || lower == "material") {
+        return FilterRule::CollectMaterial;
+    }
+    if (lower == "collectmesh" || lower == "mesh") {
+        return FilterRule::CollectMesh;
+    }
+    if (lower == "collectanimation" || lower == "animation") {
+        return FilterRule::CollectAnimation;
+    }
+    if (lower == "collecttext" || lower == "text") {
+        return FilterRule::CollectText;
+    }
+    if (lower == "collecties" || lower == "ies") {
+        return FilterRule::CollectIES;
+    }
+    if (lower == "collectprefab" || lower == "prefab") {
+        return FilterRule::CollectPrefab;
+    }
+    if (lower == "collectsprite" || lower == "sprite") {
+        return FilterRule::CollectSprite;
+    }
+    if (lower == "collectshadervariants" || lower == "shadervariants") {
+        return FilterRule::CollectShaderVariants;
+    }
+    return MakeError(ErrorCode::InvalidArgument,
+                     "unknown filter rule '" + std::string(value) + "'");
+}
+
 Result<serialize::CompressionCodec> ParseCompression(std::string_view value) {
     const std::string lower = LowerAscii(value);
     if (lower == "none") {
@@ -343,6 +518,8 @@ int CollectorPriority(CollectorType type) {
 
 } // namespace
 
+static Result<PackConfig> ParsePackConfigValue(const assets::JsonValue& root);
+
 Result<PackConfig> LoadPackConfig(std::string_view path) {
     auto bytes = ReadFileBytes(path);
     if (!bytes) {
@@ -350,11 +527,15 @@ Result<PackConfig> LoadPackConfig(std::string_view path) {
     }
     const std::string text(reinterpret_cast<const char*>(bytes.Value().data()),
                            bytes.Value().size());
-    auto parsed = assets::ParseJson(text);
+    const std::string extension = LowerAscii(core::path::Extension(path));
+    auto parsed = extension == ".toml" ? detail::ParseTomlConfig(text) : assets::ParseJson(text);
     if (!parsed) {
         return std::move(parsed).TakeError();
     }
-    const assets::JsonValue& root = parsed.Value();
+    return ParsePackConfigValue(parsed.Value());
+}
+
+static Result<PackConfig> ParsePackConfigValue(const assets::JsonValue& root) {
     if (!root.IsObject()) {
         return MakeError(ErrorCode::InvalidArgument, "pack config root must be an object");
     }
@@ -363,11 +544,13 @@ Result<PackConfig> LoadPackConfig(std::string_view path) {
     PARCEL_TRY_DECL(std::string, package_name, ReadString(root, "package"));
     PARCEL_TRY_DECL(std::string, package_version, ReadString(root, "version"));
     PARCEL_TRY_DECL(std::string, target, ReadString(root, "target", "windows"));
+    PARCEL_TRY_DECL(std::string, source, ReadString(root, "source"));
     PARCEL_TRY_DECL(std::string, cooked, ReadString(root, "cooked"));
     PARCEL_TRY_DECL(std::string, output, ReadString(root, "output"));
     config.package_name = std::move(package_name);
     config.package_version = std::move(package_version);
     config.target = std::move(target);
+    config.source_root = std::move(source);
     config.cooked_root = std::move(cooked);
     config.output_root = std::move(output);
 
@@ -400,6 +583,10 @@ Result<PackConfig> LoadPackConfig(std::string_view path) {
     PARCEL_TRY_ASSIGN(
         config.replace_asset_path_with_address,
         ReadBool(root, "replaceAssetPathWithAddress", config.replace_asset_path_with_address));
+    PARCEL_TRY_ASSIGN(config.use_source_path,
+                      ReadBool(root, "useSourcePath", config.use_source_path));
+    PARCEL_TRY_ASSIGN(config.force_sub_asset_grouping,
+                      ReadBool(root, "forceSubAssetGrouping", config.force_sub_asset_grouping));
     PARCEL_TRY_ASSIGN(config.auto_collect_shaders,
                       ReadBool(root, "autoCollectShaders", config.auto_collect_shaders));
     PARCEL_TRY_ASSIGN(config.write_builtin_catalog,
@@ -410,6 +597,8 @@ Result<PackConfig> LoadPackConfig(std::string_view path) {
         config.single_referenced_pack_alone,
         ReadBool(root, "singleReferencedPackAlone", config.single_referenced_pack_alone));
     PARCEL_TRY_ASSIGN(config.clean_output, ReadBool(root, "clean", config.clean_output));
+    PARCEL_TRY_ASSIGN(config.verify_output_hashes,
+                      ReadBool(root, "verifyOutput", config.verify_output_hashes));
     PARCEL_TRY_ASSIGN(config.output_name_style,
                       ReadUInt(root, "outputNameStyle", config.output_name_style));
     PARCEL_TRY_ASSIGN(config.build_bundle_type,
@@ -443,6 +632,8 @@ Result<PackConfig> LoadPackConfig(std::string_view path) {
         collector.type = type.Value();
         PARCEL_TRY_ASSIGN(collector.path, ReadString(item, "path"));
         PARCEL_TRY_ASSIGN(collector.files, ReadStringArray(item, "files"));
+        PARCEL_TRY_ASSIGN(collector.include_patterns, ReadStringArray(item, "include"));
+        PARCEL_TRY_ASSIGN(collector.exclude_patterns, ReadStringArray(item, "exclude"));
         PARCEL_TRY_ASSIGN(collector.recursive, ReadBool(item, "recursive", true));
         PARCEL_TRY_DECL(std::string, address_rule, ReadString(item, "addressRule", "assetPath"));
         auto rule = ParseAddressRule(address_rule);
@@ -454,7 +645,21 @@ Result<PackConfig> LoadPackConfig(std::string_view path) {
         PARCEL_TRY_ASSIGN(collector.address, ReadString(item, "address"));
         PARCEL_TRY_ASSIGN(collector.tags, ReadStringArray(item, "tags"));
         PARCEL_TRY_ASSIGN(collector.bundle, ReadString(item, "bundle"));
+        PARCEL_TRY_ASSIGN(collector.group, ReadString(item, "group"));
+        PARCEL_TRY_DECL(std::string, pack_rule, ReadString(item, "packRule", "Default"));
+        auto parsed_pack_rule = ParsePackRule(pack_rule);
+        if (!parsed_pack_rule) {
+            return std::move(parsed_pack_rule).TakeError();
+        }
+        collector.pack_rule = parsed_pack_rule.Value();
+        PARCEL_TRY_DECL(std::string, filter_rule, ReadString(item, "filterRule", "CollectAll"));
+        auto parsed_filter_rule = ParseFilterRule(filter_rule);
+        if (!parsed_filter_rule) {
+            return std::move(parsed_filter_rule).TakeError();
+        }
+        collector.filter_rule = parsed_filter_rule.Value();
         PARCEL_TRY_ASSIGN(collector.share, ReadBool(item, "share", true));
+        PARCEL_TRY_ASSIGN(collector.archive, ReadBool(item, "archive", false));
         config.collectors.push_back(std::move(collector));
     }
     if (config.collectors.empty()) {
@@ -477,9 +682,16 @@ struct Selection {
 struct AssetData {
     core::AssetGuid guid;
     std::string relative_path;
+    std::string logical_path;
     std::string absolute_path;
+    std::string source_path;
+    core::AssetGuid source_group;
     std::string type_name;
     CollectorType collector_type = CollectorType::Depend;
+    std::string collector_name;
+    std::string collector_group;
+    PackRule pack_rule = PackRule::Default;
+    bool archive = false;
     std::string address_rule_value;
     AddressRule address_rule = AddressRule::AssetPath;
     std::string address_prefix;
@@ -492,6 +704,28 @@ struct AssetData {
     std::vector<core::AssetGuid> dependencies;
     std::vector<std::byte> bytes;
     core::Hash256 hash;
+    std::uint64_t size = 0;
+    std::int64_t modified_ns = 0;
+    bool bytes_loaded = false;
+    bool stats_valid = false;
+    std::string texture_format;
+    std::uint32_t shader_variants = 0;
+    std::uint32_t shader_backends = 0;
+};
+
+struct BuildDBAsset {
+    core::AssetGuid guid;
+    std::string path;
+    std::uint64_t size = 0;
+    std::int64_t modified_ns = 0;
+    core::Hash256 hash;
+    std::string type_name;
+    std::uint32_t local_object_id = 0;
+    std::vector<core::AssetGuid> dependencies;
+    std::string texture_format;
+    std::uint32_t shader_variants = 0;
+    std::uint32_t shader_backends = 0;
+    bool stats_valid = false;
 };
 
 struct BuildDBBundle {
@@ -508,6 +742,7 @@ struct BuildDB {
     std::string package_name;
     std::string package_version;
     std::string target;
+    std::vector<BuildDBAsset> assets;
     std::vector<BuildDBBundle> bundles;
 };
 
@@ -525,6 +760,7 @@ struct BundlePlan {
     std::uint64_t file_size = 0;
     core::Hash256 file_hash;
     std::uint32_t file_crc = 0;
+    bool archive = false;
     bool reused = false;
 };
 
@@ -534,14 +770,35 @@ struct CookedFile {
     core::AssetGuid guid;
 };
 
+struct SourceAssetInfo {
+    core::AssetGuid group;
+    std::string source_path;
+    bool primary = false;
+};
+
+struct SourceMetaAsset {
+    core::AssetGuid guid;
+    std::string role;
+    std::string local_id;
+    std::size_t order = 0;
+};
+
+struct SourceGroup {
+    core::AssetGuid guid;
+    std::string source_path;
+    std::vector<SourceMetaAsset> assets;
+};
+
 struct PackContext {
     PackConfig config;
     std::string project_root;
+    std::string source_root;
     std::string cooked_root;
     std::string output_root;
     std::string output_directory;
     std::vector<CookedFile> cooked_files;
     std::map<core::AssetGuid, std::string> file_by_guid;
+    std::map<core::AssetGuid, SourceAssetInfo> source_assets;
     std::map<core::AssetGuid, std::vector<Selection>> selections;
     std::map<core::AssetGuid, AssetData> assets;
     std::set<core::AssetGuid> roots;
@@ -551,6 +808,7 @@ struct PackContext {
     std::map<std::string, BundlePlan> bundles;
     std::map<core::AssetGuid, std::pair<std::string, std::uint32_t>> payload_of;
     BuildDB build_db;
+    std::map<core::AssetGuid, BuildDBAsset> build_assets;
     PackReport report;
     std::vector<std::string> warnings;
 };
@@ -644,7 +902,405 @@ Result<std::vector<CookedFile>> ScanCookedFiles(std::string_view root) {
     return result;
 }
 
-Result<AssetData> LoadAssetData(const CookedFile& file, const CollectorConfig& collector) {
+Result<core::AssetGuid> ReadMetaGuid(const assets::JsonValue& value, std::string_view context) {
+    if (!value.IsString()) {
+        return MakeError(ErrorCode::InvalidArgument,
+                         std::string(context) + " must be a GUID string");
+    }
+    auto guid = core::Guid128::FromHex(value.string_value);
+    if (!guid) {
+        return MakeError(ErrorCode::InvalidArgument, std::string(context) + " is not a GUID");
+    }
+    if (guid.Value().IsZero()) {
+        return MakeError(ErrorCode::InvalidArgument, std::string(context) + " must not be zero");
+    }
+    return guid.Value();
+}
+
+int SourceRolePriority(std::string_view role) {
+    if (role == "scene") {
+        return 0;
+    }
+    if (role == "texture") {
+        return 1;
+    }
+    if (role == "shader") {
+        return 2;
+    }
+    if (role == "mesh") {
+        return 3;
+    }
+    if (role == "material") {
+        return 4;
+    }
+    if (role == "animation") {
+        return 5;
+    }
+    if (role == "raw") {
+        return 6;
+    }
+    if (role == "text") {
+        return 7;
+    }
+    if (role == "ies") {
+        return 8;
+    }
+    return 100;
+}
+
+Result<void> IndexSourceMetadata(PackContext& context) {
+    std::error_code error;
+    const std::filesystem::path root_path = Utf8Path(context.source_root);
+    const auto root_status = std::filesystem::status(root_path, error);
+    if (error || !std::filesystem::is_directory(root_status)) {
+        return MakeError(ErrorCode::NotFound,
+                         "source root is not a directory: " + context.source_root)
+            .WithPath(context.source_root);
+    }
+
+    std::vector<std::string> meta_files;
+    std::filesystem::recursive_directory_iterator iterator(root_path, error);
+    if (error) {
+        return MakeError(ErrorCode::Io, "failed to scan source directory: " + error.message())
+            .WithPath(context.source_root);
+    }
+    const std::filesystem::recursive_directory_iterator end;
+    for (; iterator != end; iterator.increment(error)) {
+        if (error) {
+            return MakeError(ErrorCode::Io, "failed to scan source directory: " + error.message())
+                .WithPath(context.source_root);
+        }
+        if (!iterator->is_regular_file(error)) {
+            if (error) {
+                error.clear();
+            }
+            continue;
+        }
+        const std::string absolute = NormalizePath(FromPath(iterator->path()));
+        if (LowerAscii(core::path::Extension(absolute)) != ".parcelmeta") {
+            continue;
+        }
+        if (!context.cooked_root.empty() && core::path::IsWithin(context.cooked_root, absolute)) {
+            continue;
+        }
+        if (!context.output_directory.empty() &&
+            core::path::IsWithin(context.output_directory, absolute)) {
+            continue;
+        }
+        meta_files.push_back(absolute);
+    }
+    std::sort(meta_files.begin(), meta_files.end());
+
+    std::map<core::AssetGuid, SourceGroup> groups;
+    for (const std::string& meta_path : meta_files) {
+        auto bytes = ReadFileBytes(meta_path);
+        if (!bytes) {
+            context.warnings.push_back("ignored .parcelmeta " + meta_path + ": " +
+                                       bytes.GetError().ToString());
+            continue;
+        }
+        const std::string text(reinterpret_cast<const char*>(bytes.Value().data()),
+                               bytes.Value().size());
+        auto parsed = assets::ParseJson(text);
+        if (!parsed) {
+            context.warnings.push_back("ignored .parcelmeta " + meta_path + ": " +
+                                       parsed.GetError().ToString());
+            continue;
+        }
+        const assets::JsonValue& root = parsed.Value();
+        const assets::JsonValue* version = FindField(root, "version");
+        if (!root.IsObject() || version == nullptr || !version->IsNumber() ||
+            version->number_value != 1.0) {
+            context.warnings.push_back("ignored .parcelmeta " + meta_path +
+                                       ": unsupported version");
+            continue;
+        }
+        const assets::JsonValue* source_guid = FindField(root, "sourceGuid");
+        if (source_guid == nullptr) {
+            context.warnings.push_back("ignored .parcelmeta " + meta_path + ": missing sourceGuid");
+            continue;
+        }
+        auto group_guid = ReadMetaGuid(*source_guid, "sourceGuid");
+        if (!group_guid) {
+            context.warnings.push_back("ignored .parcelmeta " + meta_path + ": " +
+                                       group_guid.GetError().ToString());
+            continue;
+        }
+        const assets::JsonValue* entries = FindField(root, "assets");
+        if (entries == nullptr || !entries->IsArray()) {
+            context.warnings.push_back("ignored .parcelmeta " + meta_path +
+                                       ": missing assets array");
+            continue;
+        }
+
+        auto relative = RelativeTo(context.project_root, meta_path);
+        if (!relative) {
+            relative = RelativeTo(context.source_root, meta_path);
+        }
+        if (!relative) {
+            context.warnings.push_back("ignored .parcelmeta " + meta_path +
+                                       ": cannot derive source path");
+            continue;
+        }
+        std::string source_path = relative.Value();
+        constexpr std::string_view kMetaSuffix = ".parcelmeta";
+        if (source_path.size() <= kMetaSuffix.size() ||
+            LowerAscii(source_path.substr(source_path.size() - kMetaSuffix.size())) !=
+                kMetaSuffix) {
+            context.warnings.push_back("ignored .parcelmeta " + meta_path +
+                                       ": invalid source path");
+            continue;
+        }
+        source_path.resize(source_path.size() - kMetaSuffix.size());
+        if (!core::path::IsSafeRelative(source_path) || HasControl(source_path)) {
+            context.warnings.push_back("ignored .parcelmeta " + meta_path +
+                                       ": source path is not safe");
+            continue;
+        }
+
+        std::vector<SourceMetaAsset> meta_assets;
+        bool valid = true;
+        for (std::size_t index = 0; index < entries->array_value.size(); ++index) {
+            const assets::JsonValue& entry = entries->array_value[index];
+            const assets::JsonValue* guid = FindField(entry, "guid");
+            if (guid == nullptr) {
+                context.warnings.push_back("ignored .parcelmeta asset " + meta_path +
+                                           ": missing guid");
+                valid = false;
+                break;
+            }
+            auto asset_guid = ReadMetaGuid(*guid, "assets[" + std::to_string(index) + "].guid");
+            if (!asset_guid) {
+                context.warnings.push_back("ignored .parcelmeta " + meta_path + ": " +
+                                           asset_guid.GetError().ToString());
+                valid = false;
+                break;
+            }
+            SourceMetaAsset meta_asset;
+            meta_asset.guid = asset_guid.Value();
+            meta_asset.order = index;
+            if (const assets::JsonValue* role = FindField(entry, "role");
+                role != nullptr && role->IsString()) {
+                meta_asset.role = role->string_value;
+            }
+            if (const assets::JsonValue* local_id = FindField(entry, "localId");
+                local_id != nullptr && local_id->IsString()) {
+                meta_asset.local_id = local_id->string_value;
+            }
+            const auto duplicate = std::find_if(
+                meta_assets.begin(), meta_assets.end(),
+                [&](const SourceMetaAsset& existing) { return existing.guid == meta_asset.guid; });
+            if (duplicate != meta_assets.end()) {
+                context.warnings.push_back("ignored .parcelmeta asset " + meta_path +
+                                           ": duplicate guid");
+                valid = false;
+                break;
+            }
+            meta_assets.push_back(std::move(meta_asset));
+        }
+        if (!valid || meta_assets.empty()) {
+            continue;
+        }
+
+        auto [group_it, inserted] =
+            groups.emplace(group_guid.Value(), SourceGroup{group_guid.Value(), source_path, {}});
+        if (!inserted && group_it->second.source_path != source_path) {
+            return MakeError(ErrorCode::InvalidArgument,
+                             "duplicate source group with different source paths")
+                .WithPath(source_path);
+        }
+        SourceGroup& group = group_it->second;
+        bool group_valid = true;
+        for (const SourceMetaAsset& meta_asset : meta_assets) {
+            const auto duplicate = std::find_if(
+                group.assets.begin(), group.assets.end(),
+                [&](const SourceMetaAsset& existing) { return existing.guid == meta_asset.guid; });
+            if (duplicate != group.assets.end()) {
+                context.warnings.push_back("ignored .parcelmeta asset " + meta_path +
+                                           ": duplicate guid across metadata");
+                group_valid = false;
+                break;
+            }
+        }
+        if (!group_valid) {
+            continue;
+        }
+        group.assets.insert(group.assets.end(), meta_assets.begin(), meta_assets.end());
+    }
+
+    for (const auto& [group_guid, group] : groups) {
+        if (group.assets.empty()) {
+            continue;
+        }
+        auto select_primary = [&](bool cooked_only) -> const SourceMetaAsset* {
+            const SourceMetaAsset* selected = nullptr;
+            for (const SourceMetaAsset& asset : group.assets) {
+                if (cooked_only && !context.file_by_guid.contains(asset.guid)) {
+                    continue;
+                }
+                if (selected == nullptr ||
+                    SourceRolePriority(asset.role) < SourceRolePriority(selected->role) ||
+                    (SourceRolePriority(asset.role) == SourceRolePriority(selected->role) &&
+                     asset.order < selected->order)) {
+                    selected = &asset;
+                }
+            }
+            return selected;
+        };
+        const SourceMetaAsset* primary = select_primary(true);
+        if (primary == nullptr) {
+            primary = select_primary(false);
+        }
+        if (primary == nullptr) {
+            continue;
+        }
+        for (const SourceMetaAsset& asset : group.assets) {
+            SourceAssetInfo info{group_guid, group.source_path, asset.guid == primary->guid};
+            const auto [it, inserted] = context.source_assets.emplace(asset.guid, std::move(info));
+            if (!inserted &&
+                (it->second.group != group_guid || it->second.source_path != group.source_path)) {
+                return MakeError(ErrorCode::InvalidArgument,
+                                 "asset GUID is declared by multiple source groups")
+                    .WithAsset(asset.guid.ToHex())
+                    .WithPath(group.source_path);
+            }
+        }
+    }
+    return {};
+}
+
+void ApplySourceInfo(PackContext& context, AssetData& asset) {
+    const auto found = context.source_assets.find(asset.guid);
+    if (found == context.source_assets.end()) {
+        return;
+    }
+    asset.source_path = found->second.source_path;
+    asset.source_group = found->second.group;
+    if (context.config.use_source_path && found->second.primary) {
+        asset.logical_path = asset.source_path;
+    }
+}
+
+bool IsVideoPath(std::string_view path) {
+    const std::string extension = LowerAscii(core::path::Extension(path));
+    return extension == ".mp4" || extension == ".mov" || extension == ".avi" ||
+           extension == ".mkv" || extension == ".webm" || extension == ".wmv" ||
+           extension == ".m4v" || extension == ".mpg" || extension == ".mpeg" ||
+           extension == ".flv";
+}
+
+std::string_view FilterSourcePath(const AssetData& asset) {
+    return asset.source_path.empty() ? std::string_view(asset.relative_path)
+                                     : std::string_view(asset.source_path);
+}
+
+bool FilterMatchesAsset(const AssetData& asset, FilterRule rule) {
+    switch (rule) {
+    case FilterRule::CollectAll:
+        return true;
+    case FilterRule::CollectScene:
+        return asset.type_name == "SceneAsset";
+    case FilterRule::CollectShader:
+        return asset.type_name == "ShaderLibraryAsset";
+    case FilterRule::CollectRaw:
+        return asset.type_name == "RawFileAsset";
+    case FilterRule::CollectVideo:
+        return asset.type_name == "RawFileAsset" && IsVideoPath(FilterSourcePath(asset));
+    case FilterRule::CollectTexture:
+        return asset.type_name == "TextureAsset";
+    case FilterRule::CollectMaterial:
+        return asset.type_name == "MaterialAsset";
+    case FilterRule::CollectMesh:
+        return asset.type_name == "MeshAsset";
+    case FilterRule::CollectAnimation:
+        return asset.type_name == "AnimationClipAsset";
+    case FilterRule::CollectText:
+        return asset.type_name == "TextAsset";
+    case FilterRule::CollectIES:
+        return asset.type_name == "IesProfileAsset";
+    case FilterRule::CollectPrefab:
+    case FilterRule::CollectSprite:
+    case FilterRule::CollectShaderVariants:
+        return false;
+    }
+    return false;
+}
+
+Result<void> ValidateCollectorRules(const CollectorConfig& collector) {
+    switch (collector.filter_rule) {
+    case FilterRule::CollectPrefab:
+        return MakeError(ErrorCode::Unsupported,
+                         "CollectPrefab filter is not supported by Parcel cooked assets");
+    case FilterRule::CollectSprite:
+        return MakeError(ErrorCode::Unsupported,
+                         "CollectSprite filter is not supported by Parcel cooked assets");
+    case FilterRule::CollectShaderVariants:
+        return MakeError(ErrorCode::Unsupported,
+                         "CollectShaderVariants filter is not supported by Parcel");
+    default:
+        break;
+    }
+    if (collector.pack_rule == PackRule::PackShaderVariants) {
+        return MakeError(ErrorCode::Unsupported, "PackShaderVariants is not supported by Parcel");
+    }
+    return {};
+}
+
+const BuildDBAsset* FindCachedAsset(const PackContext& context, const CookedFile& file,
+                                    const FileStamp& stamp) {
+    if (context.build_db.tool_version != kPackToolVersion) {
+        return nullptr;
+    }
+    const auto found = context.build_assets.find(file.guid);
+    if (found == context.build_assets.end() || found->second.path != file.relative_path ||
+        found->second.size != stamp.size || found->second.modified_ns != stamp.modified_ns) {
+        return nullptr;
+    }
+    return &found->second;
+}
+
+AssetData CachedAssetData(const CookedFile& file, const CollectorConfig& collector,
+                          const BuildDBAsset& cached, bool force_archive_raw) {
+    AssetData asset;
+    asset.guid = file.guid;
+    asset.relative_path = file.relative_path;
+    asset.logical_path = file.relative_path;
+    asset.absolute_path = file.absolute_path;
+    asset.type_name = cached.type_name;
+    asset.collector_type = collector.type;
+    asset.collector_name = collector.name;
+    asset.collector_group = collector.group;
+    asset.pack_rule = collector.pack_rule;
+    asset.archive = (collector.archive || force_archive_raw) && asset.type_name == "RawFileAsset";
+    asset.address_rule = collector.address_rule;
+    asset.address_prefix = collector.address_prefix;
+    asset.explicit_address = collector.address;
+    asset.tags = collector.tags;
+    asset.bundle_hint = collector.bundle;
+    asset.share = collector.share;
+    asset.local_object_id = cached.local_object_id;
+    asset.dependencies = cached.dependencies;
+    asset.hash = cached.hash;
+    asset.size = cached.size;
+    asset.modified_ns = cached.modified_ns;
+    asset.stats_valid = cached.stats_valid;
+    asset.texture_format = cached.texture_format;
+    asset.shader_variants = cached.shader_variants;
+    asset.shader_backends = cached.shader_backends;
+    return asset;
+}
+
+Result<AssetData> LoadAssetData(PackContext& context, const CookedFile& file,
+                                const CollectorConfig& collector) {
+    const bool force_archive_raw = context.config.build_bundle_type == 3;
+    auto stamp = ReadFileStamp(file.absolute_path);
+    if (!stamp) {
+        return std::move(stamp).TakeError();
+    }
+    if (const BuildDBAsset* cached = FindCachedAsset(context, file, stamp.Value())) {
+        context.report.reused_asset_count++;
+        return CachedAssetData(file, collector, *cached, force_archive_raw);
+    }
     auto bytes = ReadFileBytes(file.absolute_path);
     if (!bytes) {
         return std::move(bytes).TakeError();
@@ -673,9 +1329,14 @@ Result<AssetData> LoadAssetData(const CookedFile& file, const CollectorConfig& c
     AssetData asset;
     asset.guid = file.guid;
     asset.relative_path = file.relative_path;
+    asset.logical_path = file.relative_path;
     asset.absolute_path = file.absolute_path;
     asset.type_name.assign(type_entry->type_name);
     asset.collector_type = collector.type;
+    asset.collector_name = collector.name;
+    asset.collector_group = collector.group;
+    asset.pack_rule = collector.pack_rule;
+    asset.archive = (collector.archive || force_archive_raw) && asset.type_name == "RawFileAsset";
     asset.address_rule = collector.address_rule;
     asset.address_prefix = collector.address_prefix;
     asset.explicit_address = collector.address;
@@ -696,11 +1357,153 @@ Result<AssetData> LoadAssetData(const CookedFile& file, const CollectorConfig& c
     std::sort(asset.dependencies.begin(), asset.dependencies.end());
     asset.bytes = std::move(bytes).Value();
     asset.hash = core::Sha256(asset.bytes);
+    asset.size = asset.bytes.size();
+    asset.modified_ns = stamp.Value().modified_ns;
+    asset.bytes_loaded = true;
     return asset;
 }
 
 bool IsUnderPath(std::string_view root, std::string_view path) {
     return core::path::IsWithin(root, path, true);
+}
+
+struct CompiledGlob {
+    std::string pattern;
+    std::regex regex;
+};
+
+Result<std::string> NormalizeGlobPattern(std::string_view pattern) {
+    if (pattern.empty()) {
+        return MakeError(ErrorCode::InvalidArgument, "collector glob must not be empty");
+    }
+    if (pattern.find('\0') != std::string_view::npos) {
+        return MakeError(ErrorCode::InvalidArgument, "collector glob contains NUL");
+    }
+    std::string input(pattern);
+    std::replace(input.begin(), input.end(), '\\', '/');
+    if (core::path::IsAbsolute(input)) {
+        return MakeError(ErrorCode::InvalidArgument,
+                         "collector glob must be relative: " + std::string(pattern));
+    }
+
+    std::string normalized;
+    std::size_t start = 0;
+    while (start <= input.size()) {
+        const std::size_t slash = input.find('/', start);
+        const std::size_t end = slash == std::string::npos ? input.size() : slash;
+        const std::string_view segment(input.data() + start, end - start);
+        if (segment == "..") {
+            return MakeError(ErrorCode::InvalidArgument,
+                             "collector glob escapes its root: " + std::string(pattern));
+        }
+        if (!segment.empty() && segment != ".") {
+            if (!normalized.empty()) {
+                normalized.push_back('/');
+            }
+            normalized.append(segment);
+        }
+        if (slash == std::string::npos) {
+            break;
+        }
+        start = slash + 1;
+    }
+    if (normalized.empty() || normalized.find(':') != std::string::npos) {
+        return MakeError(ErrorCode::InvalidArgument,
+                         "collector glob must be a safe relative path: " + std::string(pattern));
+    }
+    return normalized;
+}
+
+Result<std::string> GlobToRegex(std::string_view pattern) {
+    std::string expression = "^";
+    for (std::size_t index = 0; index < pattern.size(); ++index) {
+        const char value = pattern[index];
+        if (value == '*') {
+            if (index + 1 < pattern.size() && pattern[index + 1] == '*') {
+                if (index + 2 < pattern.size() && pattern[index + 2] == '/') {
+                    expression += "(?:.*/)?";
+                    index += 2;
+                } else {
+                    expression += ".*";
+                    ++index;
+                }
+            } else {
+                expression += "[^/]*";
+            }
+        } else if (value == '?') {
+            expression += "[^/]";
+        } else if (value == '[') {
+            const std::size_t close = pattern.find(']', index + 1);
+            if (close == std::string_view::npos) {
+                return MakeError(ErrorCode::InvalidArgument,
+                                 "collector glob has an unterminated character class: " +
+                                     std::string(pattern));
+            }
+            std::size_t item = index + 1;
+            bool negate = false;
+            if (item < close && (pattern[item] == '!' || pattern[item] == '^')) {
+                negate = true;
+                ++item;
+            }
+            if (item == close) {
+                return MakeError(ErrorCode::InvalidArgument,
+                                 "collector glob has an empty character class: " +
+                                     std::string(pattern));
+            }
+            expression.push_back('[');
+            if (negate) {
+                expression.push_back('^');
+            }
+            for (; item < close; ++item) {
+                if (pattern[item] == '\\' || pattern[item] == '[') {
+                    expression.push_back('\\');
+                }
+                expression.push_back(pattern[item]);
+            }
+            expression.push_back(']');
+            index = close;
+        } else {
+            if (std::string_view("\\.^$|()[]{}*+?").find(value) != std::string_view::npos) {
+                expression.push_back('\\');
+            }
+            expression.push_back(value);
+        }
+    }
+    expression.push_back('$');
+    return expression;
+}
+
+Result<std::vector<CompiledGlob>> CompileGlobs(const std::vector<std::string>& patterns,
+                                               std::string_view field) {
+    std::vector<CompiledGlob> compiled;
+    compiled.reserve(patterns.size());
+    for (const std::string& pattern : patterns) {
+        auto normalized = NormalizeGlobPattern(pattern);
+        if (!normalized) {
+            return std::move(normalized).TakeError();
+        }
+        auto expression = GlobToRegex(normalized.Value());
+        if (!expression) {
+            return std::move(expression).TakeError();
+        }
+        try {
+            compiled.push_back(
+                {pattern, std::regex(expression.Value(), std::regex_constants::ECMAScript |
+                                                             std::regex_constants::optimize)});
+        } catch (const std::regex_error& error) {
+            return MakeError(ErrorCode::InvalidArgument, "invalid collector " + std::string(field) +
+                                                             " glob '" + pattern +
+                                                             "': " + error.what())
+                .WithPath(pattern);
+        }
+    }
+    return compiled;
+}
+
+bool MatchesAny(const std::vector<CompiledGlob>& globs, std::string_view relative_path) {
+    return std::any_of(globs.begin(), globs.end(), [relative_path](const CompiledGlob& glob) {
+        return std::regex_match(relative_path.begin(), relative_path.end(), glob.regex);
+    });
 }
 
 Result<std::vector<std::string>> FilesForCollector(const PackContext& context,
@@ -714,9 +1517,24 @@ Result<std::vector<std::string>> FilesForCollector(const PackContext& context,
         collector_root = resolved.Value();
     }
 
-    std::vector<std::string> result;
+    auto includes = CompileGlobs(collector.include_patterns, "include");
+    if (!includes) {
+        return std::move(includes).TakeError();
+    }
+    auto excludes = CompileGlobs(collector.exclude_patterns, "exclude");
+    if (!excludes) {
+        return std::move(excludes).TakeError();
+    }
+
     std::error_code error;
     const std::filesystem::path root_path = Utf8Path(collector_root);
+    const auto root_stat = std::filesystem::status(root_path, error);
+    if (error || !std::filesystem::exists(root_stat)) {
+        return MakeError(ErrorCode::NotFound, "collector path does not exist: " + collector_root)
+            .WithPath(collector_root);
+    }
+
+    std::vector<std::string> result;
     if (!collector.files.empty()) {
         for (const std::string& file : collector.files) {
             auto resolved = core::path::ResolveWithin(collector_root, file);
@@ -731,16 +1549,38 @@ Result<std::vector<std::string>> FilesForCollector(const PackContext& context,
             }
             result.push_back(NormalizePath(resolved.Value()));
         }
-    } else {
-        const auto stat = std::filesystem::status(root_path, error);
-        if (error || !std::filesystem::exists(stat)) {
-            return MakeError(ErrorCode::NotFound,
-                             "collector path does not exist: " + collector_root)
+    }
+    if (!collector.include_patterns.empty()) {
+        if (!std::filesystem::is_directory(root_stat)) {
+            return MakeError(ErrorCode::InvalidArgument,
+                             "collector include patterns require a directory path: " +
+                                 collector_root)
                 .WithPath(collector_root);
         }
-        if (std::filesystem::is_regular_file(stat)) {
+        std::filesystem::recursive_directory_iterator iterator(root_path, error);
+        if (error) {
+            return MakeError(ErrorCode::Io,
+                             "failed to scan collector directory: " + error.message())
+                .WithPath(collector_root);
+        }
+        const std::filesystem::recursive_directory_iterator end;
+        for (; iterator != end; iterator.increment(error)) {
+            if (error) {
+                return MakeError(ErrorCode::Io,
+                                 "failed to scan collector directory: " + error.message())
+                    .WithPath(collector_root);
+            }
+            if (iterator->is_regular_file(error)) {
+                result.push_back(NormalizePath(FromPath(iterator->path())));
+            }
+            if (error) {
+                error.clear();
+            }
+        }
+    } else if (collector.files.empty()) {
+        if (std::filesystem::is_regular_file(root_stat)) {
             result.push_back(NormalizePath(collector_root));
-        } else if (std::filesystem::is_directory(stat)) {
+        } else if (std::filesystem::is_directory(root_stat)) {
             if (collector.recursive) {
                 std::filesystem::recursive_directory_iterator iterator(root_path, error);
                 if (error) {
@@ -791,12 +1631,26 @@ Result<std::vector<std::string>> FilesForCollector(const PackContext& context,
         }
     }
 
+    const std::string match_root =
+        std::filesystem::is_directory(root_stat) ? collector_root : DirectoryOf(collector_root);
     std::vector<std::string> filtered;
     filtered.reserve(result.size());
     for (std::string& path : result) {
-        if (LowerAscii(core::path::Extension(path)) == ".prca") {
-            filtered.push_back(std::move(path));
+        if (LowerAscii(core::path::Extension(path)) != ".prca") {
+            continue;
         }
+        auto relative = RelativeTo(match_root, path);
+        if (!relative) {
+            return std::move(relative).TakeError();
+        }
+        if (MatchesAny(excludes.Value(), relative.Value())) {
+            continue;
+        }
+        if (!collector.include_patterns.empty() &&
+            !MatchesAny(includes.Value(), relative.Value())) {
+            continue;
+        }
+        filtered.push_back(std::move(path));
     }
     std::sort(filtered.begin(), filtered.end());
     filtered.erase(std::unique(filtered.begin(), filtered.end()), filtered.end());
@@ -832,6 +1686,10 @@ Result<void> CollectAssets(PackContext& context) {
         if (!collector.name.empty() && HasNul(collector.name)) {
             return MakeError(ErrorCode::InvalidArgument, "collector name contains NUL");
         }
+        auto rules_valid = ValidateCollectorRules(collector);
+        if (!rules_valid) {
+            return std::move(rules_valid).TakeError();
+        }
         if (collector.path.empty() && collector.files.empty()) {
             // Empty path means the cooked root.
         }
@@ -856,16 +1714,16 @@ std::string MakeAddress(const AssetData& asset, const PackContext& context) {
     std::string value;
     switch (asset.address_rule) {
     case AddressRule::AssetPath:
-        value = asset.relative_path;
+        value = asset.logical_path;
         break;
     case AddressRule::FileName:
-        value = StemOf(asset.relative_path);
+        value = StemOf(asset.logical_path);
         break;
     case AddressRule::Guid:
         value = asset.guid.ToHex();
         break;
     case AddressRule::Prefix:
-        value = JoinName(asset.address_prefix, StemOf(asset.relative_path));
+        value = JoinName(asset.address_prefix, StemOf(asset.logical_path));
         break;
     case AddressRule::Address:
         value = asset.explicit_address;
@@ -893,7 +1751,14 @@ Result<void> AutoCollectShaders(PackContext& context) {
             }
             continue;
         }
-        auto loaded = LoadAssetData(file, fallback);
+        auto stamp = ReadFileStamp(file.absolute_path);
+        if (stamp) {
+            if (const BuildDBAsset* cached = FindCachedAsset(context, file, stamp.Value());
+                cached != nullptr && cached->type_name != "ShaderLibraryAsset") {
+                continue;
+            }
+        }
+        auto loaded = LoadAssetData(context, file, fallback);
         if (!loaded) {
             context.warnings.push_back("auto shader scan skipped " + file.relative_path + ": " +
                                        loaded.GetError().ToString());
@@ -903,6 +1768,7 @@ Result<void> AutoCollectShaders(PackContext& context) {
         if (asset.type_name != "ShaderLibraryAsset") {
             continue;
         }
+        ApplySourceInfo(context, asset);
         asset.address = MakeAddress(asset, context);
         context.assets.emplace(file.guid, std::move(asset));
         context.roots.insert(file.guid);
@@ -911,21 +1777,22 @@ Result<void> AutoCollectShaders(PackContext& context) {
 }
 
 Result<void> LoadSelectedAssets(PackContext& context) {
+    std::vector<core::AssetGuid> filtered_out;
     for (const auto& [guid, selection_list] : context.selections) {
         if (selection_list.empty()) {
             continue;
         }
-        const Selection* chosen = &selection_list.front();
+        std::vector<const Selection*> ordered;
+        ordered.reserve(selection_list.size());
         for (const Selection& candidate : selection_list) {
-            if (CollectorPriority(candidate.collector.type) >
-                CollectorPriority(chosen->collector.type)) {
-                chosen = &candidate;
-            }
+            ordered.push_back(&candidate);
         }
-        if (selection_list.size() > 1) {
-            context.warnings.push_back("asset matched multiple collectors: " +
-                                       chosen->relative_path);
-        }
+        std::stable_sort(ordered.begin(), ordered.end(),
+                         [](const Selection* left, const Selection* right) {
+                             return CollectorPriority(left->collector.type) >
+                                    CollectorPriority(right->collector.type);
+                         });
+
         const auto file_it = context.file_by_guid.find(guid);
         if (file_it == context.file_by_guid.end()) {
             return MakeError(ErrorCode::Corrupt, "selected asset is missing from cooked files")
@@ -933,22 +1800,49 @@ Result<void> LoadSelectedAssets(PackContext& context) {
         }
         CookedFile file;
         file.guid = guid;
-        file.relative_path = chosen->relative_path;
+        file.relative_path = ordered.front()->relative_path;
         file.absolute_path = file_it->second;
-        auto loaded = LoadAssetData(file, chosen->collector);
+        auto loaded = LoadAssetData(context, file, ordered.front()->collector);
         if (!loaded) {
             return std::move(loaded).TakeError();
         }
         AssetData asset = std::move(loaded).Value();
+        ApplySourceInfo(context, asset);
+
+        const Selection* chosen = nullptr;
+        std::vector<const Selection*> accepted;
+        for (const Selection* candidate : ordered) {
+            if (!FilterMatchesAsset(asset, candidate->collector.filter_rule)) {
+                continue;
+            }
+            accepted.push_back(candidate);
+            if (chosen == nullptr) {
+                chosen = candidate;
+            }
+        }
+        if (chosen == nullptr) {
+            filtered_out.push_back(guid);
+            continue;
+        }
+        if (accepted.size() > 1) {
+            context.warnings.push_back("asset matched multiple collectors: " +
+                                       chosen->relative_path);
+        }
+
         asset.collector_type = chosen->collector.type;
+        asset.collector_name = chosen->collector.name;
+        asset.collector_group = chosen->collector.group;
+        asset.pack_rule = chosen->collector.pack_rule;
+        asset.archive = (chosen->collector.archive || context.config.build_bundle_type == 3) &&
+                        asset.type_name == "RawFileAsset";
         asset.address_rule = chosen->collector.address_rule;
         asset.address_prefix = chosen->collector.address_prefix;
         asset.explicit_address = chosen->collector.address;
         asset.tags = chosen->collector.tags;
         asset.bundle_hint = chosen->collector.bundle;
         asset.share = chosen->collector.share;
-        for (const Selection& selection : selection_list) {
-            for (const std::string& tag : selection.collector.tags) {
+        for (const Selection* selection : accepted) {
+            for (const std::string& tag : selection->collector.tags) {
                 if (std::find(asset.tags.begin(), asset.tags.end(), tag) == asset.tags.end()) {
                     asset.tags.push_back(tag);
                 }
@@ -987,6 +1881,9 @@ Result<void> LoadSelectedAssets(PackContext& context) {
         }
         context.assets.emplace(guid, std::move(asset));
     }
+    for (const core::AssetGuid& guid : filtered_out) {
+        context.selections.erase(guid);
+    }
     return {};
 }
 
@@ -1012,11 +1909,12 @@ Result<void> EnsureDependency(PackContext& context, const core::AssetGuid& guid)
     fallback.type = CollectorType::Depend;
     fallback.address_rule = AddressRule::AssetPath;
     fallback.share = true;
-    auto loaded = LoadAssetData(file, fallback);
+    auto loaded = LoadAssetData(context, file, fallback);
     if (!loaded) {
         return std::move(loaded).TakeError();
     }
     AssetData asset = std::move(loaded).Value();
+    ApplySourceInfo(context, asset);
     asset.address = MakeAddress(asset, context);
     context.assets.emplace(guid, std::move(asset));
     return {};
@@ -1118,6 +2016,63 @@ Result<void> AnalyzeDependencies(PackContext& context) {
     return {};
 }
 
+std::string TopDirectoryBundleName(std::string_view asset_path) {
+    const std::string normalized = NormalizePath(asset_path);
+    const std::size_t slash = normalized.find('/');
+    if (slash == std::string::npos || slash == 0) {
+        return "root";
+    }
+    return normalized.substr(0, slash);
+}
+
+std::string CollectorRuleBundleName(const AssetData& asset) {
+    if (!asset.collector_group.empty()) {
+        return asset.collector_group;
+    }
+    if (!asset.collector_name.empty()) {
+        return asset.collector_name;
+    }
+    return "collector";
+}
+
+Result<std::optional<std::string>> PackRuleBundleName(const AssetData& asset, PackRule rule) {
+    switch (rule) {
+    case PackRule::Default:
+        return std::optional<std::string>{};
+    case PackRule::PackSeparately:
+        return std::optional<std::string>("separate/" + asset.guid.ToHex());
+    case PackRule::PackDirectory:
+        return std::optional<std::string>(ParentBundleName(asset.logical_path));
+    case PackRule::PackTopDirectory:
+        return std::optional<std::string>(TopDirectoryBundleName(asset.logical_path));
+    case PackRule::PackCollector:
+        return std::optional<std::string>(asset.collector_name.empty() ? std::string("collector")
+                                                                       : asset.collector_name);
+    case PackRule::PackGroup:
+        return std::optional<std::string>(CollectorRuleBundleName(asset));
+    case PackRule::PackRawFile:
+        if (asset.type_name == "RawFileAsset") {
+            return std::optional<std::string>("raw/" + asset.guid.ToHex());
+        }
+        return std::optional<std::string>{};
+    case PackRule::PackVideoFile:
+        if (asset.type_name == "RawFileAsset" && IsVideoPath(FilterSourcePath(asset))) {
+            return std::optional<std::string>("raw/" + asset.guid.ToHex());
+        }
+        return std::optional<std::string>{};
+    case PackRule::PackShader:
+        if (asset.type_name == "ShaderLibraryAsset") {
+            return std::optional<std::string>(asset.collector_name.empty()
+                                                  ? std::string("shaders")
+                                                  : "shaders/" + asset.collector_name);
+        }
+        return std::optional<std::string>{};
+    case PackRule::PackShaderVariants:
+        return MakeError(ErrorCode::Unsupported, "PackShaderVariants is not supported by Parcel");
+    }
+    return std::optional<std::string>{};
+}
+
 Result<std::string> AssignBundle(PackContext& context, const core::AssetGuid& guid,
                                  std::map<core::AssetGuid, int>& state) {
     const auto existing = context.bundle_of.find(guid);
@@ -1137,14 +2092,24 @@ Result<std::string> AssignBundle(PackContext& context, const core::AssetGuid& gu
     }
     const AssetData& asset = asset_it->second;
     std::string name;
-    if (asset.type_name == "ShaderLibraryAsset") {
-        name = asset.bundle_hint.empty() ? "shaders" : asset.bundle_hint;
-    } else if (asset.type_name == "RawFileAsset") {
-        name = asset.bundle_hint.empty() ? "raw/" + asset.guid.ToHex() : asset.bundle_hint;
-    } else if (asset.collector_type == CollectorType::Depend) {
-        if (!asset.bundle_hint.empty()) {
-            name = asset.bundle_hint;
-        } else {
+    if (!asset.bundle_hint.empty()) {
+        name = asset.bundle_hint;
+    } else {
+        auto ruled = PackRuleBundleName(asset, asset.pack_rule);
+        if (!ruled) {
+            return std::move(ruled).TakeError();
+        }
+        if (ruled.Value().has_value()) {
+            name = std::move(ruled).Value().value();
+        } else if (asset.type_name == "ShaderLibraryAsset") {
+            name = "shaders";
+        } else if (asset.type_name == "RawFileAsset") {
+            if (!asset.archive) {
+                name = "raw/" + asset.guid.ToHex();
+            } else {
+                name = asset.collector_name.empty() ? "archive" : "archive/" + asset.collector_name;
+            }
+        } else if (asset.collector_type == CollectorType::Depend) {
             std::vector<core::AssetGuid> refs;
             const auto ref_it = context.referrers.find(guid);
             if (ref_it != context.referrers.end()) {
@@ -1162,7 +2127,7 @@ Result<std::string> AssignBundle(PackContext& context, const core::AssetGuid& gu
             if (share &&
                 (referrer_bundles.size() > 1 ||
                  (referrer_bundles.size() == 1 && context.config.single_referenced_pack_alone))) {
-                name = "shared/" + ParentBundleName(asset.relative_path);
+                name = "shared/" + ParentBundleName(asset.logical_path);
             } else if (!referrer_bundles.empty()) {
                 name = *referrer_bundles.begin();
                 if (referrer_bundles.size() > 1) {
@@ -1171,12 +2136,11 @@ Result<std::string> AssignBundle(PackContext& context, const core::AssetGuid& gu
                         asset.relative_path);
                 }
             } else {
-                name = "shared/" + ParentBundleName(asset.relative_path);
+                name = "shared/" + ParentBundleName(asset.logical_path);
             }
+        } else {
+            name = ParentBundleName(asset.logical_path);
         }
-    } else {
-        name =
-            asset.bundle_hint.empty() ? ParentBundleName(asset.relative_path) : asset.bundle_hint;
     }
     if (name.empty() || HasNul(name) || HasControl(name) || !core::path::IsSafeRelative(name)) {
         state.erase(guid);
@@ -1194,6 +2158,9 @@ core::AssetGuid BundleGuidFor(const PackContext& context, const BundlePlan& bund
     seed += context.config.package_name;
     seed += "|";
     seed += bundle.name;
+    if (bundle.archive) {
+        seed += "|archive";
+    }
     seed += "|";
     seed += std::to_string(static_cast<std::uint32_t>(context.config.compression));
     seed += "|";
@@ -1208,6 +2175,11 @@ core::AssetGuid BundleGuidFor(const PackContext& context, const BundlePlan& bund
         seed += guid.ToHex();
         seed += ":";
         seed += asset_it->second.hash.ToHex();
+        if (bundle.archive) {
+            seed += ":";
+            seed += context.config.replace_asset_path_with_address ? asset_it->second.address
+                                                                   : asset_it->second.logical_path;
+        }
     }
     const core::Hash256 hash = core::Sha256(seed);
     std::array<std::byte, 16> bytes{};
@@ -1217,7 +2189,111 @@ core::AssetGuid BundleGuidFor(const PackContext& context, const BundlePlan& bund
     return core::Guid128::FromBytes(std::span<const std::byte, 16>(bytes));
 }
 
+std::string SanitizeBundleFileStem(std::string_view name) {
+    std::string result;
+    result.reserve(name.size());
+    for (const unsigned char c : name) {
+        if (std::isalnum(c) != 0 || c == '.' || c == '_' || c == '-') {
+            result.push_back(static_cast<char>(c));
+        } else {
+            result.push_back('_');
+        }
+    }
+    if (result.empty()) {
+        return "bundle";
+    }
+    return result;
+}
+
+Result<std::string> BundleFileNameForStyle(const BundlePlan& bundle, std::uint32_t style) {
+    const std::string guid = bundle.guid.ToHex();
+    switch (style) {
+    case 0:
+    case static_cast<std::uint32_t>(OutputNameStyle::HashName):
+        return guid + ".bundle";
+    case static_cast<std::uint32_t>(OutputNameStyle::BundleName):
+        return SanitizeBundleFileStem(bundle.name) + ".bundle";
+    case static_cast<std::uint32_t>(OutputNameStyle::BundleNameHashName):
+        return SanitizeBundleFileStem(bundle.name) + "_" + guid + ".bundle";
+    default:
+        return MakeError(ErrorCode::InvalidArgument, "unsupported outputNameStyle")
+            .WithBundle(bundle.name);
+    }
+}
+
+Result<void> ApplySourceGroupBundles(PackContext& context) {
+    if (!context.config.force_sub_asset_grouping) {
+        return {};
+    }
+    std::map<core::AssetGuid, std::vector<core::AssetGuid>> groups;
+    for (const auto& [guid, asset] : context.assets) {
+        if (!asset.source_group.IsZero()) {
+            groups[asset.source_group].push_back(guid);
+        }
+    }
+
+    for (const auto& [group_guid, members] : groups) {
+        (void)group_guid;
+        if (members.size() < 2) {
+            continue;
+        }
+        std::set<std::string> bundle_hints;
+        std::string source_path;
+        bool has_raw = false;
+        bool all_shaders = true;
+        for (const core::AssetGuid& guid : members) {
+            const AssetData& asset = context.assets.at(guid);
+            if (!asset.bundle_hint.empty()) {
+                bundle_hints.insert(asset.bundle_hint);
+            }
+            if (!asset.source_path.empty()) {
+                if (source_path.empty()) {
+                    source_path = asset.source_path;
+                } else if (source_path != asset.source_path) {
+                    return MakeError(ErrorCode::Internal,
+                                     "source group has inconsistent source paths")
+                        .WithAsset(guid.ToHex())
+                        .WithPath(asset.source_path);
+                }
+            }
+            has_raw = has_raw || asset.type_name == "RawFileAsset";
+            all_shaders = all_shaders && asset.type_name == "ShaderLibraryAsset";
+        }
+        if (has_raw) {
+            return MakeError(ErrorCode::InvalidArgument,
+                             "raw asset cannot be grouped with other source assets")
+                .WithPath(source_path);
+        }
+        if (bundle_hints.size() > 1) {
+            return MakeError(ErrorCode::InvalidArgument,
+                             "source group has conflicting bundle hints")
+                .WithPath(source_path);
+        }
+
+        std::string name;
+        if (!bundle_hints.empty()) {
+            name = *bundle_hints.begin();
+        } else if (all_shaders) {
+            name = "shaders";
+        } else if (!source_path.empty()) {
+            name = ParentBundleName(source_path);
+        } else {
+            name = ParentBundleName(context.assets.at(members.front()).logical_path);
+        }
+        if (!IsSafeBundleName(name)) {
+            return MakeError(ErrorCode::InvalidArgument, "invalid source group bundle name")
+                .WithBundle(name)
+                .WithPath(source_path);
+        }
+        for (const core::AssetGuid& guid : members) {
+            context.assets.at(guid).bundle_hint = name;
+        }
+    }
+    return {};
+}
+
 Result<void> BuildBundlePlans(PackContext& context) {
+    PARCEL_TRY(ApplySourceGroupBundles(context));
     std::map<core::AssetGuid, int> state;
     for (const auto& [guid, asset] : context.assets) {
         (void)asset;
@@ -1238,19 +2314,41 @@ Result<void> BuildBundlePlans(PackContext& context) {
         (void)name;
         std::sort(bundle.members.begin(), bundle.members.end());
         std::set<std::string> tags;
+        std::uint32_t payload_id = 0;
         for (const core::AssetGuid& guid : bundle.members) {
             const AssetData& asset = context.assets.at(guid);
             tags.insert(asset.tags.begin(), asset.tags.end());
-            if (asset.type_name == "RawFileAsset" && bundle.members.size() > 1) {
+            if (asset.archive) {
+                bundle.archive = true;
+            }
+            if (asset.type_name == "RawFileAsset" && !asset.archive && bundle.members.size() > 1) {
                 return MakeError(ErrorCode::InvalidArgument,
                                  "raw bundle must contain exactly one asset")
                     .WithBundle(bundle.name)
                     .WithAsset(asset.relative_path);
             }
+            if (!asset.archive) {
+                context.payload_of[guid] = {bundle.name, payload_id++};
+            }
         }
         bundle.tags.assign(tags.begin(), tags.end());
         bundle.guid = BundleGuidFor(context, bundle);
-        bundle.file_name = bundle.guid.ToHex() + ".bundle";
+        auto file_name = BundleFileNameForStyle(bundle, context.config.output_name_style);
+        if (!file_name) {
+            return std::move(file_name).TakeError();
+        }
+        bundle.file_name = std::move(file_name).Value();
+    }
+
+    std::set<std::string> output_file_names;
+    for (const auto& [name, bundle] : context.bundles) {
+        (void)name;
+        if (!output_file_names.insert(bundle.file_name).second) {
+            return MakeError(ErrorCode::InvalidArgument,
+                             "duplicate bundle file name after outputNameStyle")
+                .WithBundle(bundle.name)
+                .WithPath(bundle.file_name);
+        }
     }
 
     std::map<core::AssetGuid, std::string> guid_to_bundle;
@@ -1371,6 +2469,55 @@ Result<BuildDB> LoadBuildDB(std::string_view path) {
     PARCEL_TRY_ASSIGN(db.package_name, ReadString(root, "package"));
     PARCEL_TRY_ASSIGN(db.package_version, ReadString(root, "packageVersion"));
     PARCEL_TRY_ASSIGN(db.target, ReadString(root, "target"));
+    if (const assets::JsonValue* assets = FindField(root, "assets"); assets != nullptr) {
+        if (!assets->IsArray()) {
+            return MakeError(ErrorCode::Corrupt, "build database assets must be an array")
+                .WithPath(std::string(path));
+        }
+        for (const assets::JsonValue& item : assets->array_value) {
+            if (!item.IsObject()) {
+                return MakeError(ErrorCode::Corrupt, "build database asset is not an object")
+                    .WithPath(std::string(path));
+            }
+            BuildDBAsset asset;
+            PARCEL_TRY_DECL(std::string, guid_text, ReadString(item, "guid", {}, true));
+            auto guid = core::Guid128::FromHex(guid_text);
+            if (!guid) {
+                return std::move(guid).TakeError();
+            }
+            asset.guid = guid.Value();
+            PARCEL_TRY_ASSIGN(asset.path, ReadString(item, "path", {}, true));
+            PARCEL_TRY_ASSIGN(asset.size, ReadUInt64String(item, "size", 0, true));
+            PARCEL_TRY_ASSIGN(asset.modified_ns, ReadInt64String(item, "modified", 0, true));
+            PARCEL_TRY_DECL(std::string, hash_text, ReadString(item, "hash", {}, true));
+            auto hash = core::Hash256::FromHex(hash_text);
+            if (!hash) {
+                return std::move(hash).TakeError();
+            }
+            asset.hash = hash.Value();
+            PARCEL_TRY_ASSIGN(asset.type_name, ReadString(item, "type", {}, true));
+            PARCEL_TRY_ASSIGN(asset.local_object_id, ReadUInt(item, "localObjectId", 0));
+            PARCEL_TRY_ASSIGN(asset.texture_format, ReadString(item, "textureFormat", {}));
+            PARCEL_TRY_ASSIGN(asset.shader_variants, ReadUInt(item, "shaderVariants", 0));
+            PARCEL_TRY_ASSIGN(asset.shader_backends, ReadUInt(item, "shaderBackends", 0));
+            PARCEL_TRY_ASSIGN(asset.stats_valid, ReadBool(item, "statsValid", false));
+            PARCEL_TRY_DECL(std::vector<std::string>, dependency_texts,
+                            ReadStringArray(item, "dependencies"));
+            asset.dependencies.reserve(dependency_texts.size());
+            for (const std::string& dependency_text : dependency_texts) {
+                auto dependency = core::Guid128::FromHex(dependency_text);
+                if (!dependency) {
+                    return std::move(dependency).TakeError();
+                }
+                asset.dependencies.push_back(dependency.Value());
+            }
+            std::sort(asset.dependencies.begin(), asset.dependencies.end());
+            asset.dependencies.erase(
+                std::unique(asset.dependencies.begin(), asset.dependencies.end()),
+                asset.dependencies.end());
+            db.assets.push_back(std::move(asset));
+        }
+    }
     const assets::JsonValue* bundles = FindField(root, "bundles");
     if (bundles == nullptr) {
         return db;
@@ -1490,12 +2637,52 @@ struct BuiltBundle {
     std::vector<serialize::BundlePayloadDesc> payloads;
 };
 
+Result<void> EnsureAssetBytes(AssetData& asset) {
+    if (asset.bytes_loaded) {
+        return {};
+    }
+    auto bytes = ReadFileBytes(asset.absolute_path);
+    if (!bytes) {
+        return std::move(bytes).TakeError();
+    }
+    if (core::Sha256(bytes.Value()) != asset.hash) {
+        return MakeError(ErrorCode::Corrupt,
+                         "asset content changed after the incremental build database was written")
+            .WithPath(asset.relative_path)
+            .WithAsset(asset.guid.ToHex());
+    }
+    asset.bytes = std::move(bytes).Value();
+    asset.size = asset.bytes.size();
+    asset.bytes_loaded = true;
+    return {};
+}
+
+std::string ManifestAssetPath(const PackContext& context, const AssetData& asset) {
+    return context.config.replace_asset_path_with_address ? asset.address : asset.logical_path;
+}
+
+Result<std::vector<std::byte>> ArchiveRawData(const AssetData& asset) {
+    assets::TypeRegistry registry;
+    PARCEL_TRY(assets::RegisterStandardAssetSerializers(registry));
+    auto decoded = assets::DecodeAssetBytes(asset.bytes, registry, nullptr, true);
+    if (!decoded) {
+        return std::move(decoded).TakeError();
+    }
+    if (decoded.Value()->Type() != assets::kRawFileAssetType) {
+        return MakeError(ErrorCode::Internal, "archive asset is not a raw file")
+            .WithAsset(asset.guid.ToHex());
+    }
+    const auto raw = std::static_pointer_cast<assets::RawFileAsset>(decoded.Value());
+    return raw->data;
+}
+
 Result<BuiltBundle> BuildOneBundle(const PackContext& context, const BundlePlan& bundle) {
     std::vector<std::byte> logical;
     serialize::BundleToc toc;
     toc.bundle_guid = bundle.guid;
     toc.bundle_name = bundle.name;
     toc.dependencies = bundle.dependency_guids;
+    std::set<std::string> raw_names;
     std::uint32_t payload_id = 0;
     for (const core::AssetGuid& member : bundle.members) {
         const auto asset_it = context.assets.find(member);
@@ -1507,6 +2694,34 @@ Result<BuiltBundle> BuildOneBundle(const PackContext& context, const BundlePlan&
         const AssetData& asset = asset_it->second;
         const std::size_t padding = (8U - (logical.size() % 8U)) % 8U;
         logical.insert(logical.end(), padding, std::byte{0});
+        if (asset.archive) {
+            auto raw_data = ArchiveRawData(asset);
+            if (!raw_data) {
+                return std::move(raw_data).TakeError();
+            }
+            const std::string raw_name = ManifestAssetPath(context, asset);
+            if (raw_name.empty() || HasNul(raw_name) || HasControl(raw_name) ||
+                !core::path::IsSafeRelative(raw_name)) {
+                return MakeError(ErrorCode::InvalidArgument,
+                                 "archive raw file name is not a safe relative path")
+                    .WithBundle(bundle.name)
+                    .WithAsset(member.ToHex())
+                    .WithPath(raw_name);
+            }
+            if (!raw_names.insert(raw_name).second) {
+                return MakeError(ErrorCode::InvalidArgument,
+                                 "duplicate archive raw file name in bundle")
+                    .WithBundle(bundle.name)
+                    .WithPath(raw_name);
+            }
+            serialize::BundleRawFileDesc raw;
+            raw.name = raw_name;
+            raw.logical_offset = logical.size();
+            raw.size = raw_data.Value().size();
+            toc.raw_files.push_back(std::move(raw));
+            logical.insert(logical.end(), raw_data.Value().begin(), raw_data.Value().end());
+            continue;
+        }
         serialize::BundlePayloadDesc payload;
         payload.payload_id = payload_id;
         payload.logical_offset = logical.size();
@@ -1537,9 +2752,6 @@ Result<void> BuildBundleBytes(PackContext& context) {
     std::vector<std::string> pending;
     for (auto& [name, bundle] : context.bundles) {
         (void)name;
-        for (std::size_t i = 0; i < bundle.members.size(); ++i) {
-            context.payload_of[bundle.members[i]] = {bundle.name, static_cast<std::uint32_t>(i)};
-        }
         auto reused = TryReuseBundle(context, bundle);
         if (!reused) {
             return std::move(reused).TakeError();
@@ -1552,6 +2764,18 @@ Result<void> BuildBundleBytes(PackContext& context) {
     }
     if (pending.empty()) {
         return {};
+    }
+    for (const std::string& name : pending) {
+        const BundlePlan& bundle = context.bundles.at(name);
+        for (const core::AssetGuid& member : bundle.members) {
+            const auto asset_it = context.assets.find(member);
+            if (asset_it == context.assets.end()) {
+                return MakeError(ErrorCode::Internal, "bundle member is missing")
+                    .WithBundle(name)
+                    .WithAsset(member.ToHex());
+            }
+            PARCEL_TRY(EnsureAssetBytes(asset_it->second));
+        }
     }
 
     std::vector<BuiltBundle> built(pending.size());
@@ -1671,20 +2895,23 @@ Result<std::vector<std::byte>> BuildManifestBytes(PackContext& context) {
     for (const core::AssetGuid& guid : main_assets) {
         const AssetData& asset = context.assets.at(guid);
         const std::string& bundle_name = context.bundle_of.at(guid);
-        const auto payload_it = context.payload_of.find(guid);
-        if (payload_it == context.payload_of.end()) {
-            return MakeError(ErrorCode::Internal, "main asset has no bundle payload")
-                .WithAsset(guid.ToHex());
-        }
         serialize::ManifestAssetDesc out;
         out.asset_guid = guid;
         out.address = asset.address;
-        out.asset_path =
-            context.config.replace_asset_path_with_address ? asset.address : asset.relative_path;
+        out.asset_path = ManifestAssetPath(context, asset);
         out.type_name = asset.type_name;
         out.bundle_id = bundle_index.at(bundle_name);
-        out.payload_id = payload_it->second.second;
-        out.local_object_id = asset.local_object_id;
+        if (asset.archive) {
+            out.flags |= serialize::kManifestAssetFlagArchiveRaw;
+        } else {
+            const auto payload_it = context.payload_of.find(guid);
+            if (payload_it == context.payload_of.end()) {
+                return MakeError(ErrorCode::Internal, "main asset has no bundle payload")
+                    .WithAsset(guid.ToHex());
+            }
+            out.payload_id = payload_it->second.second;
+            out.local_object_id = asset.local_object_id;
+        }
         out.tags = asset.tags;
         for (const core::AssetGuid& dependency : asset.dependencies) {
             const std::string& target = context.bundle_of.at(dependency);
@@ -1736,7 +2963,7 @@ Result<std::vector<std::byte>> BuildBuiltinCatalogBytes(const PackContext& conte
     return serialize::EncodeBuiltinCatalog(catalog);
 }
 
-void CollectReportStats(PackContext& context) {
+Result<void> CollectReportStats(PackContext& context) {
     std::map<std::string, std::uint32_t> type_counts;
     std::map<std::string, std::uint32_t> texture_formats;
     assets::TypeRegistry registry;
@@ -1745,57 +2972,66 @@ void CollectReportStats(PackContext& context) {
                                    registered.GetError().ToString());
     }
     std::map<std::string, std::vector<core::AssetGuid>> by_hash;
-    for (const auto& [guid, asset] : context.assets) {
+    for (auto& [guid, asset] : context.assets) {
         type_counts[asset.type_name]++;
         by_hash[asset.hash.ToHex()].push_back(guid);
-        context.report.total_asset_bytes += asset.bytes.size();
+        context.report.total_asset_bytes += asset.size;
         if (asset.type_name != "TextureAsset" && asset.type_name != "ShaderLibraryAsset") {
             continue;
         }
-        auto decoded = assets::DecodeAssetBytes(asset.bytes, registry, nullptr, true);
-        if (!decoded) {
-            context.warnings.push_back("failed to decode " + asset.type_name + " for report: " +
-                                       asset.relative_path + ": " + decoded.GetError().ToString());
-            continue;
+        if (!asset.stats_valid) {
+            PARCEL_TRY(EnsureAssetBytes(asset));
+            auto decoded = assets::DecodeAssetBytes(asset.bytes, registry, nullptr, true);
+            if (!decoded) {
+                context.warnings.push_back("failed to decode " + asset.type_name +
+                                           " for report: " + asset.relative_path + ": " +
+                                           decoded.GetError().ToString());
+                continue;
+            }
+            if (asset.type_name == "TextureAsset") {
+                const auto* texture =
+                    static_cast<const assets::TextureAsset*>(decoded.Value().get());
+                switch (texture->format) {
+                case assets::TextureFormat::RGBA8:
+                    asset.texture_format = "rgba8";
+                    break;
+                case assets::TextureFormat::BGRA8:
+                    asset.texture_format = "bgra8";
+                    break;
+                case assets::TextureFormat::RGBA16F:
+                    asset.texture_format = "rgba16f";
+                    break;
+                case assets::TextureFormat::RGBA32F:
+                    asset.texture_format = "rgba32f";
+                    break;
+                case assets::TextureFormat::BC1:
+                    asset.texture_format = "bc1";
+                    break;
+                case assets::TextureFormat::BC3:
+                    asset.texture_format = "bc3";
+                    break;
+                case assets::TextureFormat::BC5:
+                    asset.texture_format = "bc5";
+                    break;
+                case assets::TextureFormat::BC7:
+                    asset.texture_format = "bc7";
+                    break;
+                }
+            } else {
+                const auto* shader =
+                    static_cast<const assets::ShaderLibraryAsset*>(decoded.Value().get());
+                asset.shader_backends = static_cast<std::uint32_t>(shader->backends.size());
+                for (const assets::ShaderBackendLibrary& backend : shader->backends) {
+                    asset.shader_variants += static_cast<std::uint32_t>(backend.variants.size());
+                }
+            }
+            asset.stats_valid = true;
         }
         if (asset.type_name == "TextureAsset") {
-            const auto* texture = static_cast<const assets::TextureAsset*>(decoded.Value().get());
-            std::string format;
-            switch (texture->format) {
-            case assets::TextureFormat::RGBA8:
-                format = "rgba8";
-                break;
-            case assets::TextureFormat::BGRA8:
-                format = "bgra8";
-                break;
-            case assets::TextureFormat::RGBA16F:
-                format = "rgba16f";
-                break;
-            case assets::TextureFormat::RGBA32F:
-                format = "rgba32f";
-                break;
-            case assets::TextureFormat::BC1:
-                format = "bc1";
-                break;
-            case assets::TextureFormat::BC3:
-                format = "bc3";
-                break;
-            case assets::TextureFormat::BC5:
-                format = "bc5";
-                break;
-            case assets::TextureFormat::BC7:
-                format = "bc7";
-                break;
-            }
-            texture_formats[format]++;
+            texture_formats[asset.texture_format]++;
         } else {
-            const auto* shader =
-                static_cast<const assets::ShaderLibraryAsset*>(decoded.Value().get());
-            context.report.shader_backends += static_cast<std::uint32_t>(shader->backends.size());
-            for (const assets::ShaderBackendLibrary& backend : shader->backends) {
-                context.report.shader_variants +=
-                    static_cast<std::uint32_t>(backend.variants.size());
-            }
+            context.report.shader_backends += asset.shader_backends;
+            context.report.shader_variants += asset.shader_variants;
         }
     }
     context.report.asset_types.assign(type_counts.begin(), type_counts.end());
@@ -1828,6 +3064,7 @@ void CollectReportStats(PackContext& context) {
         }
     }
     std::sort(context.report.unused_assets.begin(), context.report.unused_assets.end());
+    return {};
 }
 
 void FillReport(PackContext& context) {
@@ -1851,10 +3088,11 @@ void FillReport(PackContext& context) {
         PackAssetReport out;
         out.guid = guid;
         out.path = asset.relative_path;
+        out.source_path = asset.source_path;
         out.type = asset.type_name;
         out.address = asset.address;
         out.bundle = context.bundle_of.at(guid);
-        out.size = asset.bytes.size();
+        out.size = asset.size;
         out.dependency_count = static_cast<std::uint32_t>(asset.dependencies.size());
         out.main = asset.collector_type == CollectorType::Main;
         context.report.assets.push_back(std::move(out));
@@ -1957,10 +3195,13 @@ assets::JsonValue BuildReportJson(const PackReport& report) {
     AddBool(root, "enableShareBundle", report.enable_share_bundle);
     AddBool(root, "singleReferencedPackAlone", report.single_referenced_pack_alone);
     AddBool(root, "autoCollectShaders", report.auto_collect_shaders);
+    AddBool(root, "outputVerified", report.output_verified);
     AddNumber(root, "assetCount", report.asset_count);
     AddNumber(root, "mainAssetCount", report.main_asset_count);
     AddNumber(root, "bundleCount", report.bundle_count);
     AddNumber(root, "reusedBundleCount", report.reused_bundle_count);
+    AddNumber(root, "reusedAssetCount", report.reused_asset_count);
+    AddNumber(root, "verifiedBundleCount", report.verified_bundle_count);
     AddNumber(root, "totalAssetBytes", static_cast<double>(report.total_asset_bytes));
     AddNumber(root, "totalBundleBytes", static_cast<double>(report.total_bundle_bytes));
     AddNumber(root, "manifestBytes", static_cast<double>(report.manifest_bytes));
@@ -1990,6 +3231,7 @@ assets::JsonValue BuildReportJson(const PackReport& report) {
         item.type = assets::JsonType::Object;
         AddString(item, "guid", asset.guid.ToHex());
         AddString(item, "path", asset.path);
+        AddString(item, "sourcePath", asset.source_path);
         AddString(item, "type", asset.type);
         AddString(item, "address", asset.address);
         AddString(item, "bundle", asset.bundle);
@@ -2043,6 +3285,34 @@ assets::JsonValue BuildDBJson(const PackContext& context) {
     AddString(root, "package", context.config.package_name);
     AddString(root, "packageVersion", context.config.package_version);
     AddString(root, "target", context.config.target);
+    assets::JsonValue assets;
+    assets.type = assets::JsonType::Array;
+    for (const auto& [guid, asset] : context.assets) {
+        assets::JsonValue item;
+        item.type = assets::JsonType::Object;
+        AddString(item, "guid", guid.ToHex());
+        AddString(item, "path", asset.relative_path);
+        AddString(item, "size", std::to_string(asset.size));
+        AddString(item, "modified", std::to_string(asset.modified_ns));
+        AddString(item, "hash", asset.hash.ToHex());
+        AddString(item, "type", asset.type_name);
+        AddNumber(item, "localObjectId", asset.local_object_id);
+        if (!asset.texture_format.empty()) {
+            AddString(item, "textureFormat", asset.texture_format);
+        }
+        if (asset.shader_variants != 0 || asset.shader_backends != 0) {
+            AddNumber(item, "shaderVariants", asset.shader_variants);
+            AddNumber(item, "shaderBackends", asset.shader_backends);
+        }
+        AddBool(item, "statsValid", asset.stats_valid);
+        std::vector<std::string> dependencies;
+        dependencies.reserve(asset.dependencies.size());
+        for (const core::AssetGuid& dependency : asset.dependencies) {
+            dependencies.push_back(dependency.ToHex());
+        }
+        item.object_value.emplace_back("dependencies", StringArray(dependencies));
+        assets.array_value.push_back(std::move(item));
+    }
     assets::JsonValue bundles;
     bundles.type = assets::JsonType::Array;
     for (const auto& [name, bundle] : context.bundles) {
@@ -2065,6 +3335,7 @@ assets::JsonValue BuildDBJson(const PackContext& context) {
         item.object_value.emplace_back("members", std::move(members));
         bundles.array_value.push_back(std::move(item));
     }
+    root.object_value.emplace_back("assets", std::move(assets));
     root.object_value.emplace_back("bundles", std::move(bundles));
     return root;
 }
@@ -2101,6 +3372,38 @@ Result<void> Build(PackContext& context) {
     }
     context.output_directory = std::move(output_directory).Value();
 
+    auto source = ResolveConfiguredPath(context, context.config.source_root);
+    if (!source) {
+        return std::move(source).TakeError();
+    }
+    context.source_root = source.Value().empty() ? context.project_root : std::move(source).Value();
+    if (context.source_root.empty()) {
+        return MakeError(ErrorCode::InvalidArgument, "source root is empty");
+    }
+
+    context.build_db = BuildDB{};
+    context.build_db.package_name = context.config.package_name;
+    context.build_db.package_version = context.config.package_version;
+    context.build_db.target = context.config.target;
+    auto db_path = core::path::Join(context.output_directory, "build_db.json");
+    if (!db_path) {
+        return std::move(db_path).TakeError();
+    }
+    auto previous_db = LoadBuildDB(db_path.Value());
+    if (previous_db) {
+        if (previous_db.Value().package_name == context.config.package_name &&
+            previous_db.Value().package_version == context.config.package_version &&
+            previous_db.Value().target == context.config.target) {
+            context.build_db = std::move(previous_db).Value();
+        }
+    } else {
+        context.warnings.push_back("ignored invalid build database: " +
+                                   previous_db.GetError().ToString());
+    }
+    for (const BuildDBAsset& asset : context.build_db.assets) {
+        context.build_assets.emplace(asset.guid, asset);
+    }
+
     core::PlatformFile platform;
     auto cooked_exists = platform.Stat(context.cooked_root);
     if (!cooked_exists) {
@@ -2125,31 +3428,14 @@ Result<void> Build(PackContext& context) {
         }
     }
 
+    if (context.config.use_source_path || context.config.force_sub_asset_grouping) {
+        PARCEL_TRY(IndexSourceMetadata(context));
+    }
     PARCEL_TRY(CollectAssets(context));
     PARCEL_TRY(LoadSelectedAssets(context));
     PARCEL_TRY(AutoCollectShaders(context));
     PARCEL_TRY(AnalyzeDependencies(context));
     PARCEL_TRY(BuildBundlePlans(context));
-
-    context.build_db = BuildDB{};
-    context.build_db.package_name = context.config.package_name;
-    context.build_db.package_version = context.config.package_version;
-    context.build_db.target = context.config.target;
-    auto db_path = core::path::Join(context.output_directory, "build_db.json");
-    if (!db_path) {
-        return std::move(db_path).TakeError();
-    }
-    auto previous_db = LoadBuildDB(db_path.Value());
-    if (previous_db) {
-        if (previous_db.Value().package_name == context.config.package_name &&
-            previous_db.Value().package_version == context.config.package_version &&
-            previous_db.Value().target == context.config.target) {
-            context.build_db = std::move(previous_db).Value();
-        }
-    } else {
-        context.warnings.push_back("ignored invalid build database: " +
-                                   previous_db.GetError().ToString());
-    }
 
     PARCEL_TRY(BuildBundleBytes(context));
     auto manifest = BuildManifestBytes(context);
@@ -2166,7 +3452,7 @@ Result<void> Build(PackContext& context) {
         builtin_catalog = std::move(catalog).Value();
         context.report.builtin_catalog_bytes = builtin_catalog.size();
     }
-    CollectReportStats(context);
+    PARCEL_TRY(CollectReportStats(context));
     FillReport(context);
 
     PARCEL_TRY(EnsureDirectory(context.output_directory));
@@ -2189,13 +3475,22 @@ Result<void> Build(PackContext& context) {
         return std::move(version_path).TakeError();
     }
     PARCEL_TRY(WriteTextFile(version_path.Value(), context.config.package_version + "\n"));
+    auto catalog_path =
+        core::path::Join(context.output_directory, serialize::kBuiltinCatalogFileName);
+    if (!catalog_path) {
+        return std::move(catalog_path).TakeError();
+    }
     if (context.config.write_builtin_catalog) {
-        auto catalog_path =
-            core::path::Join(context.output_directory, serialize::kBuiltinCatalogFileName);
-        if (!catalog_path) {
-            return std::move(catalog_path).TakeError();
-        }
         PARCEL_TRY(WriteBytesAtomic(catalog_path.Value(), builtin_catalog));
+    } else {
+        core::PlatformFile catalog_file;
+        auto exists = catalog_file.Exists(catalog_path.Value());
+        if (!exists) {
+            return std::move(exists).TakeError();
+        }
+        if (exists.Value()) {
+            PARCEL_TRY(catalog_file.Delete(catalog_path.Value()));
+        }
     }
     PARCEL_TRY(CleanOldBundles(context));
     PARCEL_TRY(WriteBuildDB(context));
@@ -2203,6 +3498,144 @@ Result<void> Build(PackContext& context) {
 }
 
 } // namespace
+
+Result<PackVerifyResult> VerifyPackOutput(std::string_view output_directory) {
+    if (output_directory.empty()) {
+        return MakeError(ErrorCode::InvalidArgument, "output directory is empty");
+    }
+    core::PlatformFile platform;
+    auto output_stat = platform.Stat(output_directory);
+    if (!output_stat) {
+        return std::move(output_stat).TakeError();
+    }
+    if (!output_stat.Value().exists || !output_stat.Value().is_directory) {
+        return MakeError(ErrorCode::NotFound, "pack output directory does not exist")
+            .WithPath(std::string(output_directory));
+    }
+
+    auto manifest_path = core::path::Join(output_directory, "manifest.bytes");
+    if (!manifest_path) {
+        return std::move(manifest_path).TakeError();
+    }
+    auto manifest = serialize::LoadManifestFile(manifest_path.Value(), true);
+    if (!manifest) {
+        return std::move(manifest).TakeError();
+    }
+
+    auto hash_path = core::path::Join(output_directory, "manifest.hash");
+    if (!hash_path) {
+        return std::move(hash_path).TakeError();
+    }
+    auto hash_bytes = ReadFileBytes(hash_path.Value());
+    if (!hash_bytes) {
+        return std::move(hash_bytes).TakeError();
+    }
+    const std::string hash_text = TrimAsciiWhitespace(std::string_view(
+        reinterpret_cast<const char*>(hash_bytes.Value().data()), hash_bytes.Value().size()));
+    auto sidecar_hash = core::Hash256::FromHex(hash_text);
+    if (!sidecar_hash) {
+        return std::move(sidecar_hash).TakeError().WithPath(hash_path.Value());
+    }
+    if (sidecar_hash.Value() != manifest.Value().Header().content_hash) {
+        return MakeError(ErrorCode::HashMismatch, "manifest hash sidecar does not match manifest")
+            .WithPath(hash_path.Value());
+    }
+
+    auto version_path = core::path::Join(output_directory,
+                                         std::string(manifest.Value().PackageName()) + ".version");
+    if (!version_path) {
+        return std::move(version_path).TakeError();
+    }
+    auto version_bytes = ReadFileBytes(version_path.Value());
+    if (!version_bytes) {
+        return std::move(version_bytes).TakeError();
+    }
+    const std::string version_text = TrimAsciiWhitespace(std::string_view(
+        reinterpret_cast<const char*>(version_bytes.Value().data()), version_bytes.Value().size()));
+    if (version_text != manifest.Value().PackageVersion()) {
+        return MakeError(ErrorCode::HashMismatch, "package version file does not match manifest")
+            .WithPath(version_path.Value());
+    }
+
+    auto bundle_directory = core::path::Join(output_directory, "bundles");
+    if (!bundle_directory) {
+        return std::move(bundle_directory).TakeError();
+    }
+    PackVerifyResult result;
+    for (const serialize::ManifestBundleView& bundle : manifest.Value().Bundles()) {
+        if (bundle.file_name.empty()) {
+            return MakeError(ErrorCode::Corrupt,
+                             "manifest contains a bundle with an empty file name")
+                .WithBundle(std::string(bundle.bundle_name));
+        }
+        auto bundle_path = core::path::Join(bundle_directory.Value(), bundle.file_name);
+        if (!bundle_path) {
+            return std::move(bundle_path).TakeError();
+        }
+        auto bytes = ReadFileBytes(bundle_path.Value());
+        if (!bytes) {
+            return std::move(bytes).TakeError();
+        }
+        if (bytes.Value().size() != bundle.file_size) {
+            return MakeError(ErrorCode::HashMismatch, "bundle file size does not match manifest")
+                .WithPath(bundle_path.Value())
+                .WithBundle(std::string(bundle.bundle_name));
+        }
+        if (core::Sha256(bytes.Value()) != bundle.file_sha256) {
+            return MakeError(ErrorCode::HashMismatch, "bundle file SHA-256 does not match manifest")
+                .WithPath(bundle_path.Value())
+                .WithBundle(std::string(bundle.bundle_name));
+        }
+        if (core::Crc32(bytes.Value()) != bundle.file_crc) {
+            return MakeError(ErrorCode::HashMismatch, "bundle file CRC32 does not match manifest")
+                .WithPath(bundle_path.Value())
+                .WithBundle(std::string(bundle.bundle_name));
+        }
+        ++result.bundle_count;
+    }
+
+    auto catalog_path = core::path::Join(output_directory, serialize::kBuiltinCatalogFileName);
+    if (!catalog_path) {
+        return std::move(catalog_path).TakeError();
+    }
+    auto catalog_exists = platform.Exists(catalog_path.Value());
+    if (!catalog_exists) {
+        return std::move(catalog_exists).TakeError();
+    }
+    if (catalog_exists.Value()) {
+        auto catalog_bytes = ReadFileBytes(catalog_path.Value());
+        if (!catalog_bytes) {
+            return std::move(catalog_bytes).TakeError();
+        }
+        auto catalog = serialize::DecodeBuiltinCatalog(catalog_bytes.Value());
+        if (!catalog) {
+            return std::move(catalog).TakeError();
+        }
+        if (catalog.Value().package_name != manifest.Value().PackageName() ||
+            catalog.Value().package_version != manifest.Value().PackageVersion()) {
+            return MakeError(ErrorCode::HashMismatch,
+                             "builtin catalog package does not match manifest")
+                .WithPath(catalog_path.Value());
+        }
+        if (catalog.Value().entries.size() != manifest.Value().Bundles().size()) {
+            return MakeError(ErrorCode::HashMismatch,
+                             "builtin catalog bundle count does not match manifest")
+                .WithPath(catalog_path.Value());
+        }
+        for (const serialize::BuiltinCatalogEntry& entry : catalog.Value().entries) {
+            const serialize::ManifestBundleView* bundle =
+                manifest.Value().FindBundleByGuid(entry.bundle_guid);
+            if (bundle == nullptr || bundle->file_name != entry.file_name) {
+                return MakeError(ErrorCode::HashMismatch,
+                                 "builtin catalog entry does not match manifest")
+                    .WithPath(catalog_path.Value())
+                    .WithBundle(entry.file_name);
+            }
+        }
+        result.catalog_verified = true;
+    }
+    return result;
+}
 
 Result<PackSummary> RunPack(const PackConfig& input) {
     PackConfig config = input;
@@ -2214,6 +3647,16 @@ Result<PackSummary> RunPack(const PackConfig& input) {
     }
     if (config.compression_level < 0 || config.compression_level > 22) {
         return MakeError(ErrorCode::InvalidArgument, "invalid compression level");
+    }
+    if (config.output_name_style > 3) {
+        return MakeError(ErrorCode::InvalidArgument, "unsupported outputNameStyle");
+    }
+    if (config.build_bundle_type == static_cast<std::uint32_t>(BuildBundleType::RawFile)) {
+        return MakeError(ErrorCode::Unsupported,
+                         "buildBundleType RawFile is not supported by Parcel");
+    }
+    if (config.build_bundle_type > 3) {
+        return MakeError(ErrorCode::InvalidArgument, "unsupported buildBundleType");
     }
     if (config.enable_addressable && config.location_to_lower) {
         return MakeError(ErrorCode::InvalidArgument,
@@ -2283,6 +3726,20 @@ Result<PackSummary> RunPack(const PackConfig& input) {
         return std::move(result).TakeError();
     }
 
+    if (context.config.verify_output_hashes) {
+        auto verified = VerifyPackOutput(context.output_directory);
+        if (!verified) {
+            context.report.errors.push_back(verified.GetError().ToString());
+            auto report_written = WriteBuildReport(context.output_directory, context.report);
+            if (!report_written) {
+                context.warnings.push_back("failed to write verification failure report: " +
+                                           report_written.GetError().ToString());
+            }
+            return std::move(verified).TakeError();
+        }
+        context.report.output_verified = true;
+        context.report.verified_bundle_count = verified.Value().bundle_count;
+    }
     auto report_written = WriteBuildReport(context.output_directory, context.report);
     if (!report_written) {
         return std::move(report_written).TakeError();
@@ -2294,5 +3751,3 @@ Result<PackSummary> RunPack(const PackConfig& input) {
 }
 
 } // namespace parcel::pack
-
-

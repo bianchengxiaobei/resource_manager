@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "parcel/core/guid.hpp"
 #include "parcel/core/hash.hpp"
@@ -30,18 +30,66 @@ enum class AddressRule : std::uint8_t {
     Address,
 };
 
+enum class PackRule : std::uint8_t {
+    Default,
+    PackSeparately,
+    PackDirectory,
+    PackTopDirectory,
+    PackCollector,
+    PackGroup,
+    PackRawFile,
+    PackVideoFile,
+    PackShader,
+    PackShaderVariants,
+};
+
+enum class OutputNameStyle : std::uint8_t {
+    HashName = 1,
+    BundleName = 2,
+    BundleNameHashName = 3,
+};
+
+enum class BuildBundleType : std::uint8_t {
+    AssetBundle = 1,
+    RawFile = 2,
+    Archive = 3,
+};
+
+enum class FilterRule : std::uint8_t {
+    CollectAll,
+    CollectScene,
+    CollectShader,
+    CollectRaw,
+    CollectVideo,
+    CollectTexture,
+    CollectMaterial,
+    CollectMesh,
+    CollectAnimation,
+    CollectText,
+    CollectIES,
+    CollectPrefab,
+    CollectSprite,
+    CollectShaderVariants,
+};
+
 struct CollectorConfig {
     std::string name;
     CollectorType type = CollectorType::Main;
     std::string path;
     std::vector<std::string> files;
+    std::vector<std::string> include_patterns;
+    std::vector<std::string> exclude_patterns;
     bool recursive = true;
     AddressRule address_rule = AddressRule::AssetPath;
     std::string address_prefix;
     std::string address;
     std::vector<std::string> tags;
     std::string bundle;
+    std::string group;
+    PackRule pack_rule = PackRule::Default;
+    FilterRule filter_rule = FilterRule::CollectAll;
     bool share = true;
+    bool archive = false;
 };
 
 struct PackConfig {
@@ -49,6 +97,7 @@ struct PackConfig {
     std::string package_name;
     std::string package_version;
     std::string target = "windows";
+    std::string source_root;
     std::string cooked_root;
     std::string output_root;
 
@@ -62,11 +111,14 @@ struct PackConfig {
     bool location_to_lower = false;
     bool include_asset_guid = false;
     bool replace_asset_path_with_address = false;
+    bool use_source_path = true;
+    bool force_sub_asset_grouping = true;
     bool auto_collect_shaders = true;
     bool enable_share_bundle = true;
     bool single_referenced_pack_alone = false;
     bool write_builtin_catalog = true;
     bool clean_output = false;
+    bool verify_output_hashes = false;
 
     std::uint32_t output_name_style = 1;
     std::uint32_t build_bundle_type = 1;
@@ -77,6 +129,7 @@ struct PackConfig {
 struct PackAssetReport {
     core::AssetGuid guid;
     std::string path;
+    std::string source_path;
     std::string type;
     std::string address;
     std::string bundle;
@@ -107,6 +160,7 @@ struct PackReport {
     bool enable_share_bundle = true;
     bool single_referenced_pack_alone = false;
     bool auto_collect_shaders = true;
+    bool output_verified = false;
 
     std::uint64_t total_asset_bytes = 0;
     std::uint64_t total_bundle_bytes = 0;
@@ -116,6 +170,8 @@ struct PackReport {
     std::uint32_t main_asset_count = 0;
     std::uint32_t bundle_count = 0;
     std::uint32_t reused_bundle_count = 0;
+    std::uint32_t reused_asset_count = 0;
+    std::uint32_t verified_bundle_count = 0;
     std::uint32_t shader_variants = 0;
     std::uint32_t shader_backends = 0;
 
@@ -135,9 +191,15 @@ struct PackSummary {
     PackReport report;
 };
 
+struct PackVerifyResult {
+    std::uint32_t bundle_count = 0;
+    bool catalog_verified = false;
+};
+
 [[nodiscard]] Result<PackConfig> LoadPackConfig(std::string_view path);
 
 [[nodiscard]] Result<PackSummary> RunPack(const PackConfig& config);
 
-} // namespace parcel::pack
+[[nodiscard]] Result<PackVerifyResult> VerifyPackOutput(std::string_view output_directory);
 
+} // namespace parcel::pack

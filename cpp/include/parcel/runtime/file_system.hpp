@@ -96,6 +96,14 @@ class IFileSystem {
     }
 
     [[nodiscard]] virtual core::Result<void>
+    ImportBundle(const serialize::ManifestBundleView& bundle, std::span<const std::byte> bytes) {
+        (void)bundle;
+        (void)bytes;
+        return core::MakeError(core::ErrorCode::Unsupported,
+                               "this file system cannot import bundles");
+    }
+
+    [[nodiscard]] virtual core::Result<void>
     DownloadBundle(const serialize::ManifestBundleView& bundle) {
         (void)bundle;
         return core::MakeError(core::ErrorCode::Unsupported,
@@ -110,6 +118,7 @@ class IFileSystem {
     }
 
     [[nodiscard]] virtual bool SupportsBundleDownload() const noexcept { return false; }
+    [[nodiscard]] virtual bool SupportsBundleImport() const noexcept { return false; }
 
     [[nodiscard]] virtual core::Result<std::string>
     DownloadTempPath(const serialize::ManifestBundleView& bundle) {
@@ -136,8 +145,7 @@ class IFileSystem {
     [[nodiscard]] virtual core::Result<CacheStats> QueryCache() const { return CacheStats{}; }
 
     [[nodiscard]] virtual core::Result<CacheVerifyStatus>
-    VerifyCachedBundle(const serialize::ManifestBundleView& bundle,
-                       CacheVerifyLevel level) const {
+    VerifyCachedBundle(const serialize::ManifestBundleView& bundle, CacheVerifyLevel level) const {
         (void)bundle;
         (void)level;
         return CacheVerifyStatus::Unsupported;
@@ -168,9 +176,7 @@ class BuiltinFileSystem final : public IFileSystem {
 
     [[nodiscard]] std::string_view Root() const noexcept { return root_; }
     [[nodiscard]] bool HasCatalog() const noexcept { return catalog_loaded_; }
-    [[nodiscard]] std::size_t CatalogEntryCount() const noexcept {
-        return catalog_paths_.size();
-    }
+    [[nodiscard]] std::size_t CatalogEntryCount() const noexcept { return catalog_paths_.size(); }
 
   private:
     [[nodiscard]] core::Result<std::string> BundlePath(std::string_view file_name) const;
@@ -202,9 +208,12 @@ class SandboxFileSystem : public IFileSystem {
     LoadBundle(const serialize::ManifestBundleView& bundle) override;
     [[nodiscard]] core::Result<void>
     EnsureBundle(const serialize::ManifestBundleView& bundle) override;
+    [[nodiscard]] core::Result<void> ImportBundle(const serialize::ManifestBundleView& bundle,
+                                                  std::span<const std::byte> bytes) override;
     [[nodiscard]] core::Result<void>
     InvalidateBundle(const serialize::ManifestBundleView& bundle) override;
     [[nodiscard]] bool SupportsBundleDownload() const noexcept override { return initialized_; }
+    [[nodiscard]] bool SupportsBundleImport() const noexcept override { return initialized_; }
     [[nodiscard]] core::Result<std::string>
     DownloadTempPath(const serialize::ManifestBundleView& bundle) override;
     [[nodiscard]] core::Result<void>
@@ -279,8 +288,7 @@ class FileSystemHost {
     [[nodiscard]] core::Result<void> ClearCache(const CacheClearOptions& options);
     [[nodiscard]] core::Result<CacheStats> QueryCache() const;
     [[nodiscard]] core::Result<CacheVerifyStatus>
-    VerifyCachedBundle(const serialize::ManifestBundleView& bundle,
-                       CacheVerifyLevel level) const;
+    VerifyCachedBundle(const serialize::ManifestBundleView& bundle, CacheVerifyLevel level) const;
 
   private:
     std::string package_name_;
@@ -289,5 +297,3 @@ class FileSystemHost {
 };
 
 } // namespace parcel::runtime
-
-

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <filesystem>
 #include <system_error>
 #include <utility>
@@ -22,6 +23,7 @@ using core::Result;
 constexpr std::array<std::byte, 4> kSidecarMagic = {std::byte{'P'}, std::byte{'R'}, std::byte{'C'},
                                                     std::byte{'C'}};
 constexpr std::uint16_t kSidecarVersion = 1;
+std::atomic<std::uint64_t> g_import_sequence{0};
 
 Result<std::vector<std::byte>> ReadFile(std::string_view path) {
     core::PlatformFile platform;
@@ -216,8 +218,7 @@ Result<void> BuiltinFileSystem::LoadBuiltinCatalog() {
     catalog_paths_.clear();
     catalog_guid_paths_.clear();
     catalog_loaded_ = false;
-    auto catalog_path =
-        core::path::ResolveWithin(root_, serialize::kBuiltinCatalogFileName);
+    auto catalog_path = core::path::ResolveWithin(root_, serialize::kBuiltinCatalogFileName);
     if (!catalog_path) {
         return std::move(catalog_path).TakeError();
     }
@@ -369,8 +370,7 @@ Result<CacheVerifyStatus>
 BuiltinFileSystem::VerifyCachedBundle(const serialize::ManifestBundleView& bundle,
                                       CacheVerifyLevel level) const {
     if (!initialized_) {
-        return MakeError(ErrorCode::InvalidArgument,
-                         "builtin file system is not initialized");
+        return MakeError(ErrorCode::InvalidArgument, "builtin file system is not initialized");
     }
     auto path = BundlePath(bundle.file_name);
     if (!path) {
@@ -740,6 +740,38 @@ Result<void> SandboxFileSystem::EnsureBundle(const serialize::ManifestBundleView
     return std::move(verification).TakeError();
 }
 
+Result<void> SandboxFileSystem::ImportBundle(const serialize::ManifestBundleView& bundle,
+                                             std::span<const std::byte> bytes) {
+    if (!initialized_) {
+        return MakeError(ErrorCode::InvalidArgument, "sandbox file system is not initialized");
+    }
+    if (options_.read_only) {
+        return MakeError(ErrorCode::Unsupported, "sandbox file system is read-only")
+            .WithBundle(std::string(bundle.bundle_name));
+    }
+    PARCEL_TRY(VerifyBytes(bundle, bytes));
+
+    auto temp_root = core::path::ResolveWithin(root_, "temp");
+    if (!temp_root) {
+        return std::move(temp_root).TakeError();
+    }
+    core::PlatformFile platform;
+    PARCEL_TRY(platform.CreateDirectories(temp_root.Value()));
+    const std::uint64_t sequence = g_import_sequence.fetch_add(1, std::memory_order_relaxed);
+    auto temp_path = core::path::ResolveWithin(
+        temp_root.Value(), bundle.bundle_guid.ToHex() + "-" + std::to_string(sequence) + ".part");
+    if (!temp_path) {
+        return std::move(temp_path).TakeError();
+    }
+    PARCEL_TRY(WriteFile(temp_path.Value(), bytes));
+    auto committed = CommitDownloadedBundle(bundle, temp_path.Value());
+    if (!committed) {
+        (void)platform.Delete(temp_path.Value());
+        return std::move(committed).TakeError();
+    }
+    return {};
+}
+
 Result<CacheVerifyStatus>
 SandboxFileSystem::VerifyCachedBundle(const serialize::ManifestBundleView& bundle,
                                       CacheVerifyLevel level) const {
@@ -812,6 +844,10 @@ Result<void> SandboxFileSystem::CommitDownloadedBundle(const serialize::Manifest
                                                        std::string_view temp_path) {
     if (!initialized_) {
         return MakeError(ErrorCode::InvalidArgument, "sandbox file system is not initialized");
+    }
+    if (options_.read_only) {
+        return MakeError(ErrorCode::Unsupported, "sandbox file system is read-only")
+            .WithBundle(std::string(bundle.bundle_name));
     }
     if (!core::path::IsWithin(root_, temp_path)) {
         return MakeError(ErrorCode::InvalidArgument, "temporary bundle path escapes the sandbox")
@@ -1140,17 +1176,17 @@ FileSystemHost::VerifyCachedBundle(const serialize::ManifestBundleView& bundle,
             continue;
         }
         switch (result.Value()) {
-            case CacheVerifyStatus::Valid:
-                valid = true;
-                break;
-            case CacheVerifyStatus::Corrupt:
-                corrupt = true;
-                break;
-            case CacheVerifyStatus::Missing:
-                missing = true;
-                break;
-            case CacheVerifyStatus::Unsupported:
-                break;
+        case CacheVerifyStatus::Valid:
+            valid = true;
+            break;
+        case CacheVerifyStatus::Corrupt:
+            corrupt = true;
+            break;
+        case CacheVerifyStatus::Missing:
+            missing = true;
+            break;
+        case CacheVerifyStatus::Unsupported:
+            break;
         }
     }
     if (corrupt) {
@@ -1207,8 +1243,3 @@ Result<CacheStats> FileSystemHost::QueryCache() const {
 }
 
 } // namespace parcel::runtime
-
-
-
-
-

@@ -106,7 +106,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/client/config", s.limit("client-config", s.cfg.RateLimitDefault, s.handleClientConfig))
 	s.mux.HandleFunc("GET /api/v1/client/version", s.limit("client-version", s.cfg.RateLimitDefault, s.handleClientVersion))
 	s.mux.Handle("GET /api/v1/client/url", s.limit("client-url", s.cfg.RateLimitDefault, s.requireClient(s.handleClientURL)))
-	s.mux.HandleFunc("GET /files/", s.limit("files", s.cfg.RateLimitDownload, s.handleFile))
+	s.mux.HandleFunc("GET /files/{path...}", s.limit("files", s.cfg.RateLimitDownload, s.handleFile))
 
 	s.mux.HandleFunc("POST /api/v1/admin/login", s.limit("login", s.cfg.RateLimitLogin, s.handleLogin))
 	s.mux.HandleFunc("POST /api/v1/admin/logout", s.requireAdmin(s.handleLogout))
@@ -119,10 +119,14 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /api/v1/admin/packages", s.requireAdmin(s.handleListPackages))
 	s.mux.Handle("POST /api/v1/admin/packages", s.requireAdmin(s.handleCreatePackage))
 	s.mux.Handle("GET /api/v1/admin/packages/{pkg}", s.requireAdmin(s.handleGetPackage))
+	s.mux.Handle("PATCH /api/v1/admin/packages/{pkg}", s.requireAdmin(s.handleRenamePackage))
+	s.mux.Handle("DELETE /api/v1/admin/packages/{pkg}", s.requireAdmin(s.handleDeletePackage))
 	s.mux.Handle("GET /api/v1/admin/packages/{pkg}/versions", s.requireAdmin(s.handleListVersions))
 	s.mux.Handle("POST /api/v1/admin/packages/{pkg}/versions", s.limit("upload", s.cfg.RateLimitUpload,
 		s.requireAdmin(s.handleUploadVersion)))
 	s.mux.Handle("GET /api/v1/admin/packages/{pkg}/versions/{version}", s.requireAdmin(s.handleGetVersion))
+	s.mux.Handle("PATCH /api/v1/admin/packages/{pkg}/versions/{version}", s.requireAdmin(s.handleRenameVersion))
+	s.mux.Handle("DELETE /api/v1/admin/packages/{pkg}/versions/{version}", s.requireAdmin(s.handleDeleteVersion))
 	s.mux.Handle("POST /api/v1/admin/packages/{pkg}/versions/{version}/publish", s.requireAdmin(s.handlePublish))
 	s.mux.Handle("POST /api/v1/admin/packages/{pkg}/rollback", s.requireAdmin(s.handleRollback))
 	s.mux.Handle("GET /api/v1/admin/packages/{pkg}/channels", s.requireAdmin(s.handleListChannels))
@@ -163,7 +167,7 @@ func (s *Server) cors(next http.Handler) http.Handler {
 			writer.Header().Set("Vary", "Origin")
 			writer.Header().Set("Access-Control-Allow-Credentials", "true")
 			writer.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-CSRF-Token, X-API-Key, X-Request-ID")
-			writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		}
 		if request.Method == http.MethodOptions {
 			writer.WriteHeader(http.StatusNoContent)
@@ -483,6 +487,8 @@ func mapStoreError(writer http.ResponseWriter, request *http.Request, err error)
 		writeError(writer, request, http.StatusNotFound, "not_found", "resource not found")
 	case errors.Is(err, store.ErrConflict):
 		writeError(writer, request, http.StatusConflict, "conflict", "resource already exists")
+	case errors.Is(err, store.ErrInUse):
+		writeError(writer, request, http.StatusConflict, "conflict", "resource is in use")
 	case errors.Is(err, store.ErrInvalid):
 		writeError(writer, request, http.StatusBadRequest, "invalid_request", "invalid request")
 	default:

@@ -1,4 +1,4 @@
-﻿# 07 `parcel_hbg`：hdrp-bgfx 适配层
+# 07 `parcel_hbg`：hdrp-bgfx 适配层
 
 ## 1. 约束
 
@@ -178,7 +178,7 @@ public:
   字段映射与基础校验。
 - 测试：`test_entt.cpp`、`test_hbg.cpp`，包含最小 scene → RenderScene、节点顺序/层级、动画 channel 映射、
   material/transform/settings/shader 物化、回滚/卸载、错误路径。当前全量
-  225 cases / 6162 assertions，Debug/Release/no-exceptions/UBSan 通过；ASan 由 R09 构建覆盖。
+  Debug 284 cases / 15730 assertions；Release/no-exceptions 282 / 13072 通过；UBSan/ASan 由 R09 构建覆盖。
 
 构建：
 

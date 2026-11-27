@@ -51,17 +51,6 @@ hbg::Mat4 ToHbg(const parcel::Mat4& value) {
     return result;
 }
 
-hbg::Bounds ToHbg(const parcel::Bounds& bounds) {
-    hbg::Bounds result;
-    result.min =
-        ToHbg(parcel::Vec3{bounds.center.x - bounds.extents.x, bounds.center.y - bounds.extents.y,
-                           bounds.center.z - bounds.extents.z});
-    result.max =
-        ToHbg(parcel::Vec3{bounds.center.x + bounds.extents.x, bounds.center.y + bounds.extents.y,
-                           bounds.center.z + bounds.extents.z});
-    return result;
-}
-
 hbg::Mat4 ToMatrix(const TransformComponent& transform) {
     const float x = transform.rotation.x;
     const float y = transform.rotation.y;
@@ -98,28 +87,6 @@ hbg::Mat4 ToMatrix(const TransformComponent& transform) {
     translation[13] = transform.position.y;
     translation[14] = transform.position.z;
     return translation * rotation * scale;
-}
-
-hbg::gfx::TextureFormat ToHbgTextureFormat(parcel::assets::TextureFormat format) {
-    switch (format) {
-    case parcel::assets::TextureFormat::RGBA8:
-        return hbg::gfx::TextureFormat::RGBA8;
-    case parcel::assets::TextureFormat::BGRA8:
-        return hbg::gfx::TextureFormat::BGRA8;
-    case parcel::assets::TextureFormat::RGBA16F:
-        return hbg::gfx::TextureFormat::RGBA16F;
-    case parcel::assets::TextureFormat::RGBA32F:
-        return hbg::gfx::TextureFormat::RGBA32F;
-    case parcel::assets::TextureFormat::BC1:
-        return hbg::gfx::TextureFormat::BC1;
-    case parcel::assets::TextureFormat::BC3:
-        return hbg::gfx::TextureFormat::BC3;
-    case parcel::assets::TextureFormat::BC5:
-        return hbg::gfx::TextureFormat::BC5;
-    case parcel::assets::TextureFormat::BC7:
-        return hbg::gfx::TextureFormat::BC7;
-    }
-    return hbg::gfx::TextureFormat::RGBA8;
 }
 
 Result<hbg::Mat4> ComputeWorld(const ::entt::registry& registry, ::entt::entity entity,
@@ -721,14 +688,24 @@ Result<int> SceneRenderBridge::ResolveImage(AssetGuid guid, hbg::render::RenderS
         return MakeError(ErrorCode::InvalidArgument, "image texture has no valid mip");
     }
 
+    auto materialized = MaterializeTexture(*texture, guid.ToHex());
+    if (!materialized) {
+        return std::move(materialized).TakeError();
+    }
+    const MaterializedTexture& converted = materialized.Value();
+    if (!converted.storage) {
+        return MakeError(ErrorCode::Internal, "materialized image storage is missing");
+    }
+
     hbg::asset::ImageAsset image;
     image.name = guid.ToHex();
-    image.width = texture->mips.front().width;
-    image.height = texture->mips.front().height;
-    image.format = ToHbgTextureFormat(texture->format);
-    image.pixels.resize(texture->mips.front().data.size());
+    image.width = converted.desc.width;
+    image.height = converted.desc.height;
+    image.mipCount = converted.desc.mipCount;
+    image.format = converted.desc.format;
+    image.pixels.resize(converted.storage->size());
     if (!image.pixels.empty()) {
-        std::memcpy(image.pixels.data(), texture->mips.front().data.data(), image.pixels.size());
+        std::memcpy(image.pixels.data(), converted.storage->data(), image.pixels.size());
     }
     const int index = static_cast<int>(scene.images.size());
     scene.images.push_back(std::move(image));
@@ -767,6 +744,10 @@ Result<void> SceneRenderBridge::Update(const ::entt::registry& registry,
             scene_node_indices.emplace(id, node->second);
         }
     }
+
+    std::unordered_map<AssetGuid, int, parcel::core::Guid128Hash> material_cache;
+    std::unordered_map<std::string, int> mesh_cache;
+    int fallback_material_index = -1;
 
     std::vector<::entt::entity> player_entities;
     for (const auto entity : registry.view<const AnimationPlayerComponent>()) {
@@ -944,6 +925,11 @@ Result<void> SceneRenderBridge::Update(const ::entt::registry& registry,
                     if (material_guid.IsZero()) {
                         continue;
                     }
+                    const auto cached = material_cache.find(material_guid);
+                    if (cached != material_cache.end()) {
+                        material_indices.push_back(cached->second);
+                        continue;
+                    }
                     auto material_asset = ResolveTypedAsset(resolver_, material_guid,
                                                             parcel::assets::kMaterialAssetType);
                     if (!material_asset) {
@@ -956,20 +942,20 @@ Result<void> SceneRenderBridge::Update(const ::entt::registry& registry,
                     if (!material) {
                         return std::move(material).TakeError();
                     }
-                    material_indices.push_back(static_cast<int>(rebuilt.materials.size()));
+                    const int material_index = static_cast<int>(rebuilt.materials.size());
                     rebuilt.materials.push_back(std::move(material).Value());
+                    material_cache.emplace(material_guid, material_index);
+                    material_indices.push_back(material_index);
                 }
 
-                hbg::asset::Material fallback;
-                fallback.name = name.empty() ? "DefaultMaterial" : name + ".Material";
-                bool fallback_added = false;
                 auto fallback_index = [&]() {
-                    if (!fallback_added) {
-                        material_indices.push_back(static_cast<int>(rebuilt.materials.size()));
-                        rebuilt.materials.push_back(fallback);
-                        fallback_added = true;
+                    if (fallback_material_index < 0) {
+                        hbg::asset::Material fallback;
+                        fallback.name = "DefaultMaterial";
+                        fallback_material_index = static_cast<int>(rebuilt.materials.size());
+                        rebuilt.materials.push_back(std::move(fallback));
                     }
-                    return static_cast<int>(rebuilt.materials.size() - 1);
+                    return fallback_material_index;
                 };
 
                 hbg::asset::Mesh converted = std::move(mesh).Value();
@@ -992,6 +978,27 @@ Result<void> SceneRenderBridge::Update(const ::entt::registry& registry,
                 if (converted.submeshes.empty() && material_indices.empty()) {
                     fallback_index();
                 }
+
+                std::string mesh_key = renderer->mesh.ToHex();
+                for (const hbg::asset::SubMesh& submesh : converted.submeshes) {
+                    mesh_key += ':' + std::to_string(submesh.materialIndex);
+                }
+                const bool share_mesh =
+                    converted.skinVertices.empty() && converted.morphTargets.empty();
+                int mesh_index = -1;
+                if (share_mesh) {
+                    const auto cached = mesh_cache.find(mesh_key);
+                    if (cached != mesh_cache.end()) {
+                        mesh_index = cached->second;
+                    }
+                }
+                if (mesh_index < 0) {
+                    mesh_index = static_cast<int>(rebuilt.meshes.size());
+                    if (share_mesh) {
+                        mesh_cache.emplace(mesh_key, mesh_index);
+                    }
+                }
+                const hbg::Bounds local_bounds = converted.bounds;
 
                 int skin_index = -1;
                 if (!converted.skinVertices.empty()) {
@@ -1075,13 +1082,13 @@ Result<void> SceneRenderBridge::Update(const ::entt::registry& registry,
                 object.name = name;
                 object.nodeIndex = node_index;
                 object.skinIndex = skin_index;
-                object.meshIndex = static_cast<std::uint32_t>(rebuilt.meshes.size());
+                object.meshIndex = static_cast<std::uint32_t>(mesh_index);
                 object.morphWeights = std::move(morph_weights);
                 object.world = world.Value();
                 object.prevWorld = world.Value();
                 object.worldBounds = skin_index >= 0
-                                         ? converted.bounds
-                                         : hbg::transformBounds(object.world, converted.bounds);
+                                         ? local_bounds
+                                         : hbg::transformBounds(object.world, local_bounds);
                 object.staticShadowCaster = skin_index < 0;
                 object.sortingLayer = renderer->sorting_layer;
                 object.sortingOrder = renderer->sorting_order;
@@ -1089,7 +1096,9 @@ Result<void> SceneRenderBridge::Update(const ::entt::registry& registry,
                 object.lightLayerMask = renderer->light_layer_mask;
                 object.decalLayerMask = renderer->decal_layer_mask;
                 rebuilt.objects.push_back(std::move(object));
-                rebuilt.meshes.push_back(std::move(converted));
+                if (mesh_index == static_cast<int>(rebuilt.meshes.size())) {
+                    rebuilt.meshes.push_back(std::move(converted));
+                }
             }
         }
 
